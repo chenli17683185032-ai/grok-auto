@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.7"
+APP_VERSION = "1.8.9"
 
 
 def _on_startup() -> None:
@@ -705,11 +705,13 @@ class _ReasoningCompatState:
 
     def __init__(self, mode: str | None = None) -> None:
         self.mode = (mode or REASONING_COMPAT or "off").strip().lower()
+        # Explicit opt-in aliases for think_tag (legacy "on" meant inject into content).
         if self.mode in ("1", "true", "yes", "on"):
             self.mode = "think_tag"
-        if self.mode not in ("off", "think_tag", "content", "none", ""):
-            self.mode = "think_tag"
         if self.mode in ("none", ""):
+            self.mode = "off"
+        # Unknown values fail closed: keep reasoning out of visible content.
+        if self.mode not in ("off", "think_tag", "content"):
             self.mode = "off"
         self.think_open = False
         self.saw_reasoning = False
@@ -1413,18 +1415,16 @@ async def _stream_proxy_with_failover(
                                 reasoning if reasoning else None,
                             )
 
-                            if (
-                                emit_content
-                                or emit_reasoning
-                                or tool_calls
-                                or finish
-                            ):
+                            if finish:
+                                # Hold finish until stream drain so we can attach
+                                # usage on the same terminal chunk. sub2api/new-api
+                                # typically read usage from the finish_reason frame
+                                # and ignore a later usage-only chunk.
                                 stream_started = True
-                                if finish:
-                                    finished = True
-                                    held_finish = finish
-                                # Close <think> before finish if still open.
-                                if finish and not client_gone:
+                                finished = True
+                                held_finish = finish
+                                # Close <think> before terminal finish if still open.
+                                if not client_gone:
                                     close_tag = reasoning_compat.close_tag_chunk()
                                     if close_tag:
                                         yield _sse_chunk(
@@ -1433,22 +1433,10 @@ async def _stream_proxy_with_failover(
                                             created=created,
                                             content=close_tag,
                                         )
-                                emit_finish = (
-                                    _normalize_stream_finish_reason(
-                                        finish, saw_tool_calls=saw_tool_calls
-                                    )
-                                    if finish
-                                    else None
-                                )
+
+                            if emit_content or emit_reasoning or tool_calls:
+                                stream_started = True
                                 if client_gone:
-                                    continue
-                                # Skip completely empty deltas (no content/reasoning/tools/finish)
-                                if not (
-                                    emit_content
-                                    or emit_reasoning
-                                    or tool_calls
-                                    or emit_finish
-                                ):
                                     continue
                                 yield _sse_chunk(
                                     chat_id=chat_id,
@@ -1457,8 +1445,10 @@ async def _stream_proxy_with_failover(
                                     content=emit_content,
                                     reasoning=emit_reasoning,
                                     tool_calls=tool_calls,
-                                    finish_reason=emit_finish,
                                 )
+                            elif finish:
+                                # finish-only upstream frame: content already held
+                                continue
                     else:
                         raw = await resp.aread()
                         try:
@@ -1467,14 +1457,15 @@ async def _stream_proxy_with_failover(
                             text = raw.decode("utf-8", errors="replace")
                             content_parts.append(text)
                             stream_started = True
-                            yield _sse_chunk(
-                                chat_id=chat_id,
-                                model=model,
-                                created=created,
-                                content=text,
-                                finish_reason="stop",
-                            )
+                            if not client_gone:
+                                yield _sse_chunk(
+                                    chat_id=chat_id,
+                                    model=model,
+                                    created=created,
+                                    content=text,
+                                )
                             finished = True
+                            held_finish = "stop"
                         else:
                             if isinstance(data.get("usage"), dict):
                                 usage = data["usage"]
@@ -1543,7 +1534,7 @@ async def _stream_proxy_with_failover(
                                     created=created,
                                     reasoning=emit_reasoning,
                                 )
-                            if emit_tc:
+                            if emit_tc and not client_gone:
                                 indexed: list[Any] = []
                                 for i, tc in enumerate(emit_tc):
                                     if isinstance(tc, dict):
@@ -1558,12 +1549,7 @@ async def _stream_proxy_with_failover(
                                     created=created,
                                     tool_calls=indexed,
                                 )
-                            yield _sse_chunk(
-                                chat_id=chat_id,
-                                model=model,
-                                created=created,
-                                finish_reason=finish_reason,
-                            )
+                            # Defer finish_reason to terminal chunk with usage.
                             finished = True
                             held_finish = finish_reason
 
@@ -1574,6 +1560,17 @@ async def _stream_proxy_with_failover(
                 held_finish if finished else None,
                 saw_tool_calls=saw_tool_calls,
             ) or ("tool_calls" if saw_tool_calls else "stop")
+            # Prefer real completion tokens from streamed content+reasoning; many
+            # relays mark empty completion_tokens as a failed playground turn.
+            # Compute usage BEFORE emitting finish so sub2api/new-api can read it
+            # from the finish_reason chunk (they often ignore a later usage-only).
+            norm_usage = _usage_from_body_and_output(
+                body,
+                content="".join(content_parts),
+                reasoning="".join(reasoning_parts),
+                tool_calls=final_tc,
+                usage=usage,
+            )
             if not client_gone:
                 close_tag = reasoning_compat.close_tag_chunk()
                 if close_tag:
@@ -1583,34 +1580,17 @@ async def _stream_proxy_with_failover(
                         created=created,
                         content=close_tag,
                     )
-            if not finished and not client_gone:
+                # Single terminal finish frame WITH usage (Scheme A). This is the
+                # chunk secondary relays like sub2api inspect for token billing.
                 yield _sse_chunk(
                     chat_id=chat_id,
                     model=model,
                     created=created,
                     finish_reason=terminal_finish,
+                    usage=norm_usage,
                 )
-            elif finished and saw_tool_calls and held_finish in (None, "stop", "end_turn", ""):
-                # Upstream finished with stop despite tools — emit a corrective
-                # finish frame so secondary relays/tool runners don't hang.
-                if not client_gone:
-                    yield _sse_chunk(
-                        chat_id=chat_id,
-                        model=model,
-                        created=created,
-                        finish_reason="tool_calls",
-                    )
-            # OpenAI-compatible final usage chunk (empty choices) for sub2api/newapi
-            # Prefer real completion tokens from streamed content+reasoning; many
-            # relays mark empty completion_tokens as a failed playground turn.
-            norm_usage = _usage_from_body_and_output(
-                body,
-                content="".join(content_parts),
-                reasoning="".join(reasoning_parts),
-                tool_calls=final_tc,
-                usage=usage,
-            )
-            if not client_gone:
+                # OpenAI-compatible usage-only fallback (empty choices) for
+                # clients that follow stream_options.include_usage strictly.
                 yield _sse_chunk(
                     chat_id=chat_id,
                     model=model,

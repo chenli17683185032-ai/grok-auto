@@ -22,7 +22,7 @@
 | 额度统计 | 汇总排除禁用 / 耗尽账号，显示可用额度 |
 | 注册引擎 | `dongguatanglinux/grok-build-auth` HTTP 协议注册（MoeMail + YesCaptcha） |
 | 注册稳定性 | 先打码再收邮箱验证码；`create_account` 错误码识别；CreateSession 回退；多线程批量注册 |
-| 中继兼容 | 剥离 `presence_penalty` / `frequency_penalty` 等上游不支持参数；reasoning → `<think>` content；SSE keepalive |
+| 中继兼容 | 剥离 `presence_penalty` / `frequency_penalty` 等上游不支持参数；reasoning 默认走 `reasoning_content`（可选 `<think>`）；SSE keepalive |
 | 管理台 | 账号搜索 / 多选 / 批量删除 / 续期 / 导出；注册数量 / 并发 / 启动间隔 |
 | Docker | 协议依赖镜像（`curl_cffi` / `requests`） |
 
@@ -327,18 +327,18 @@ else:
 | 类型 | OpenAI 兼容 |
 | Base URL | `http://host:40081` 或 Docker 内网 `http://172.17.0.1:40081` |
 | 模型 | `grok-4.5` |
-| `thinking_to_content` | 可开（本服务也会把 reasoning 写入 content） |
+| `thinking_to_content` | **建议关闭**（默认不再把 reasoning 写入 content；需要时再开） |
 | `auto_ban` | 建议关闭或谨慎开启 |
 
 说明：
 
 - 上游 **不支持** `presence_penalty` / `frequency_penalty` 等参数；本服务会自动剥离，避免操练场空白回复
-- 流式会输出 reasoning 兼容内容（默认 `<think>...</think>` + 正文）
+- 默认把 reasoning 放在 `reasoning_content`，**不**写入正文；需要中继可见思考时设 `GROK2API_REASONING_COMPAT=think_tag`
 - 长思考间隔会发 SSE keepalive，降低中继空闲断流
 
 相关环境变量：
 
-- `GROK2API_REASONING_COMPAT=think_tag|content|off`（默认 `think_tag`）
+- `GROK2API_REASONING_COMPAT=off|think_tag|content`（默认 `off`）
 - `GROK2API_SSE_KEEPALIVE=8`（秒）
 
 ---
@@ -399,7 +399,7 @@ else:
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `GROK2API_REASONING_COMPAT` | `think_tag` | `think_tag` / `content` / `off` |
+| `GROK2API_REASONING_COMPAT` | `off` | `off` / `think_tag` / `content` |
 | `GROK2API_SSE_KEEPALIVE` | `8` | 空闲 keepalive 秒数 |
 
 ---

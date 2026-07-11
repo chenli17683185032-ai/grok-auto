@@ -180,10 +180,12 @@ TIMEOUT = float(os.getenv("GROK2API_TIMEOUT", "600"))
 SSE_KEEPALIVE_INTERVAL = float(os.getenv("GROK2API_SSE_KEEPALIVE", "8"))
 
 # Compatibility for relays/UIs that only render delta.content (not reasoning_content).
-# - off: pass through reasoning_content only
+# Default off: keep reasoning in reasoning_content so OpenAI→Claude relays (sub2api)
+# do not dump thinking into visible assistant content.
+# - off: pass through reasoning_content only (recommended for sub2api / Claude clients)
 # - think_tag: stream reasoning as content wrapped in <think>...</think>
 # - content: merge reasoning into content without tags
-REASONING_COMPAT = os.getenv("GROK2API_REASONING_COMPAT", "think_tag").strip().lower()
+REASONING_COMPAT = os.getenv("GROK2API_REASONING_COMPAT", "off").strip().lower()
 
 # Map common aliases -> real model ids (OpenAI + Anthropic client defaults)
 MODEL_ALIASES: dict[str, str] = {
