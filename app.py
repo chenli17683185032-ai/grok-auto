@@ -594,13 +594,125 @@ def _completion_tokens_estimate(
     return total
 
 
+def _nonneg_int(value: Any) -> int | None:
+    """Return value as a non-negative int, or None if not a clean integer."""
+    # bool is a subclass of int — reject before the int branch.
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if value < 0 or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        if s.startswith("+"):
+            s = s[1:]
+        # Digits only — reject negatives, floats, scientific notation, junk.
+        if not s.isdigit():
+            return None
+        return int(s)
+    return None
+
+
+def _detail_cached_tokens(details: Any) -> int | None:
+    if not isinstance(details, dict):
+        return None
+    return _nonneg_int(details.get("cached_tokens"))
+
+
+def _select_cached_tokens(usage: dict[str, Any]) -> int | None:
+    """Pick a cache hit count using standard-first, positive-first priority.
+
+    Candidate order (first positive wins; else first explicit zero):
+      1. prompt_tokens_details.cached_tokens
+      2. input_tokens_details.cached_tokens
+      3. prompt_cache_hit_tokens
+      4. cached_tokens
+      5. cache_read_input_tokens
+    """
+    candidates: list[int | None] = [
+        _detail_cached_tokens(usage.get("prompt_tokens_details")),
+        _detail_cached_tokens(usage.get("input_tokens_details")),
+        _nonneg_int(usage.get("prompt_cache_hit_tokens")),
+        _nonneg_int(usage.get("cached_tokens")),
+        _nonneg_int(usage.get("cache_read_input_tokens")),
+    ]
+    first_zero: int | None = None
+    for c in candidates:
+        if c is None:
+            continue
+        if c > 0:
+            return c
+        if first_zero is None:
+            first_zero = c
+    return first_zero
+
+
+def _shallow_copy_details(details: Any) -> dict[str, Any] | None:
+    if not isinstance(details, dict):
+        return None
+    return dict(details)
+
+
+def _scrub_invalid_cached_tokens(details: dict[str, Any] | None) -> None:
+    """Drop non-integer / negative cached_tokens from a shallow-copied details."""
+    if details is None or "cached_tokens" not in details:
+        return
+    if _nonneg_int(details.get("cached_tokens")) is None:
+        details.pop("cached_tokens", None)
+
+
+def _attach_cache_details(
+    result: dict[str, Any], usage: dict[str, Any]
+) -> None:
+    """Passthrough detail objects and normalize cached_tokens for New API."""
+    prompt_details = _shallow_copy_details(usage.get("prompt_tokens_details"))
+    input_details = _shallow_copy_details(usage.get("input_tokens_details"))
+    completion_details = _shallow_copy_details(
+        usage.get("completion_tokens_details")
+    )
+
+    _scrub_invalid_cached_tokens(prompt_details)
+    _scrub_invalid_cached_tokens(input_details)
+
+    if completion_details is not None:
+        result["completion_tokens_details"] = completion_details
+    if input_details is not None:
+        result["input_tokens_details"] = input_details
+
+    cached = _select_cached_tokens(usage)
+
+    if prompt_details is not None:
+        if cached is not None:
+            prompt_details["cached_tokens"] = cached
+        if prompt_details or cached is not None:
+            result["prompt_tokens_details"] = prompt_details
+    elif input_details is not None:
+        # Chat Completions billing path reads prompt_tokens_details.
+        prompt_details = dict(input_details)
+        if cached is not None:
+            prompt_details["cached_tokens"] = cached
+        result["prompt_tokens_details"] = prompt_details
+    elif cached is not None:
+        result["prompt_tokens_details"] = {"cached_tokens": cached}
+
+
 def _normalize_usage(
     usage: dict[str, Any] | None,
     *,
     prompt_fallback: int = 0,
     completion_fallback: int = 0,
-) -> dict[str, int]:
-    """Normalize OpenAI-style usage; fill missing fields for secondary relays."""
+) -> dict[str, Any]:
+    """Normalize OpenAI-style usage; fill missing fields for secondary relays.
+
+    Preserves upstream cache detail fields when present and normalizes
+    cache-hit aliases into ``prompt_tokens_details.cached_tokens`` for
+    New API / OpenAI Chat Completions billing. Never estimates cache.
+    """
     prompt = 0
     completion = 0
     if isinstance(usage, dict):
@@ -648,11 +760,14 @@ def _normalize_usage(
             reported_total = 0
         if reported_total > total:
             total = reported_total
-    return {
+    result: dict[str, Any] = {
         "prompt_tokens": int(prompt),
         "completion_tokens": int(completion),
         "total_tokens": int(total),
     }
+    if isinstance(usage, dict):
+        _attach_cache_details(result, usage)
+    return result
 
 
 def _usage_from_body_and_output(
@@ -662,7 +777,7 @@ def _usage_from_body_and_output(
     reasoning: str = "",
     tool_calls: list[Any] | None = None,
     usage: dict[str, Any] | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     prompt_fb = _messages_prompt_estimate(body.get("messages"))
     # tools schema also consumes prompt tokens roughly
     if body.get("tools"):
