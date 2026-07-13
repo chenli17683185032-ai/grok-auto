@@ -2706,6 +2706,25 @@ def get_registration_batch(batch_id: str) -> dict[str, Any] | None:
         return None
     sids = list(b.get("session_ids") or [])
     stats = _batch_stats(sids, batch=b)
+    stored_status = str(b.get("status") or "").lower()
+    if not b.get("runner_alive") and stored_status in {
+        "done",
+        "partial",
+        "error",
+        "cancelled",
+        "stopped",
+    }:
+        # Some failures happen before a session id exists (for example mailbox
+        # creation). The runner counters still cover them and are authoritative.
+        stats["batch_status"] = stored_status
+        stats["running"] = 0
+        stats["done"] = max(int(stats.get("done") or 0), int(b.get("finished") or 0))
+        stats["imported"] = max(
+            int(stats.get("imported") or 0), int(b.get("ok_count") or 0)
+        )
+        stats["error"] = max(
+            int(stats.get("error") or 0), int(b.get("fail_count") or 0)
+        )
     # Keep response bounded for large batches: newest sessions first for UI.
     MAX_BATCH_SESSIONS = 120
     sessions = []
