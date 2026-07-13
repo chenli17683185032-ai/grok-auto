@@ -26,6 +26,7 @@ from config import (
     MODEL_PROBE_WORKERS,
     PROBE_MODELS,
     UPSTREAM_BASE,
+    UPSTREAM_PROXY,
 )
 from maintenance_gate import maintenance_slot
 
@@ -113,6 +114,16 @@ _ACCOUNT_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SHARED_EGRESS_RE = re.compile(
+    r"model\s+.+?\s+is\s+not\s+available\s+in\s+your\s+region",
+    re.IGNORECASE,
+)
+
+
+def is_shared_egress_error(error: str | None) -> bool:
+    """True when the failure belongs to the server exit, not one account."""
+    return bool(_SHARED_EGRESS_RE.search((error or "").strip()))
+
 
 def is_temporary_usage_error(
     error: str | None, status_code: int | None = None
@@ -135,6 +146,8 @@ def is_model_unavailable_error(
     """True only for durable model unavailability (not free-usage 429)."""
     text = (error or "").strip()
     if not text:
+        return False
+    if is_shared_egress_error(text):
         return False
     # Temporary free usage / rate limits are never permanent model blocks.
     if is_temporary_usage_error(text, status_code):
@@ -378,6 +391,9 @@ def probe_model_for_creds(
         """Mutate pool only when scanned and error class matches a policy."""
         if not auto_disable or not creds.auth_key:
             return
+        if is_shared_egress_error(err_text):
+            base["auto_action"] = {"shared_egress_error": True}
+            return
         try:
             import account_pool
         except Exception:
@@ -497,7 +513,9 @@ def probe_model_for_creds(
             base["in_cooldown"] = False
 
     try:
-        with httpx.Client(timeout=_PROBE_TIMEOUT) as client:
+        with httpx.Client(
+            timeout=_PROBE_TIMEOUT, proxy=UPSTREAM_PROXY or None
+        ) as client:
             with client.stream("POST", url, headers=headers, json=body) as resp:
                 status = resp.status_code
                 if status >= 400:

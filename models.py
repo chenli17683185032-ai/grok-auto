@@ -15,6 +15,7 @@ from config import (
     MODEL_ALIASES,
     MODELS_CACHE,
     UPSTREAM_BASE,
+    UPSTREAM_PROXY,
 )
 
 
@@ -113,7 +114,7 @@ def sync_models_from_upstream(path: Path | None = None) -> dict[str, Any]:
 
     url = f"{UPSTREAM_BASE}/models"
     try:
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(timeout=30.0, proxy=UPSTREAM_PROXY or None) as client:
             resp = client.get(url, headers=_upstream_headers(creds.token))
     except httpx.HTTPError as e:
         return {"ok": False, "error": f"network: {e}"}

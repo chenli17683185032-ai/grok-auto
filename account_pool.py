@@ -1112,6 +1112,18 @@ def report_failure(
     if not account_id:
         return None
 
+    try:
+        from model_health import is_shared_egress_error
+
+        if is_shared_egress_error(error):
+            return {
+                "action": "shared_egress_error",
+                "account_id": account_id,
+                "status_code": status_code,
+            }
+    except Exception:
+        pass
+
     # Read streak before writing so adaptive cooldown can scale.
     state = get_account_pool_state()
     meta = _pool_meta(account_id, state)

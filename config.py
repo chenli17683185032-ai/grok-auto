@@ -75,6 +75,9 @@ UPSTREAM_BASE = os.getenv(
     "GROK_CLI_CHAT_PROXY_BASE_URL",
     "https://cli-chat-proxy.grok.com/v1",
 ).rstrip("/")
+# Optional proxy for cli-chat-proxy traffic only. Registration, mail and OIDC
+# remain direct unless their existing dedicated proxy settings are configured.
+UPSTREAM_PROXY = os.getenv("GROK2API_UPSTREAM_PROXY", "").strip()
 
 # App data — fully self-contained under project (or GROK2API_DATA_DIR)
 APP_ROOT = Path(__file__).resolve().parent

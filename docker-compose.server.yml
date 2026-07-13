@@ -7,6 +7,22 @@ x-logging: &logging
     max-file: "3"
 
 services:
+  grok-egress:
+    image: "${GROK2API_EGRESS_IMAGE:-metacubex/mihomo:v1.19.28}"
+    restart: unless-stopped
+    logging: *logging
+    command: ["-d", "/root/.config/mihomo"]
+    volumes:
+      - "${GROK2API_EGRESS_CONFIG_DIR:-./mihomo}:/root/.config/mihomo:ro"
+    cpus: "0.20"
+    mem_limit: 192m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -64,6 +80,7 @@ services:
       GROK2API_TOKEN_MAINTAIN: "1"
       GROK2API_MODEL_HEALTH: "1"
       GROK2API_REQUIRE_API_KEY: "1"
+      GROK2API_UPSTREAM_PROXY: http://grok-egress:7890
       REDIS_URL: redis://grokcli-upstream-redis:6379/0
       GROK2API_REDIS_URL: redis://grokcli-upstream-redis:6379/0
       DATABASE_URL: "postgresql://grok2api:${GROK2API_POSTGRES_PASSWORD}@grokcli-upstream-postgres:5432/grok2api"
@@ -100,6 +117,8 @@ services:
         aliases:
           - grokcli-2api
     depends_on:
+      grok-egress:
+        condition: service_healthy
       redis:
         condition: service_healthy
       postgres:

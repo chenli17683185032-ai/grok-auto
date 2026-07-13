@@ -49,6 +49,7 @@ from config import (
     STATIC_DIR,
     TIMEOUT,
     UPSTREAM_BASE,
+    UPSTREAM_PROXY,
 )
 import config as _config
 import history_compact
@@ -109,6 +110,7 @@ async def get_http_client() -> httpx.AsyncClient:
                 max_connections=max_conn,
                 keepalive_expiry=90.0,
             ),
+            proxy=UPSTREAM_PROXY or None,
             http2=False,
         )
     return _http_client
