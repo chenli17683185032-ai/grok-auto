@@ -28,10 +28,14 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-13-reg-stop-fast-1"
-# Newly registered accounts often need a short settle window before probe.
+ADAPTER_BUILD = "2026-07-14-reg-probe-fast-1"
+# Kept for the existing registration API/config contract. Production uses 0 so
+# a newly imported account is probed immediately.
 REGISTER_PROBE_DELAY_SEC = float(
-    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
+    os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "0") or 0
+)
+REGISTER_PROBE_RETRY_SEC = float(
+    os.environ.get("GROK2API_REG_PROBE_RETRY_SEC", "300") or 300
 )
 
 YESCAPTCHA_KEY = (
@@ -80,9 +84,6 @@ _batches: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
 # batch_id -> True while a local ThreadPool spawner is alive in THIS process.
 _active_batch_runners: dict[str, bool] = {}
-# Local captcha solver is process-local and can collapse under fan-out; serialize
-# the createTask/getTaskResult handshake across registration workers.
-_local_captcha_lock = threading.RLock()
 _xconsole_ready = False
 _xconsole_error: str | None = None
 
@@ -90,6 +91,35 @@ REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "
 # How many jobs may be pre-created (mailbox + session) beyond the live concurrency
 # cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
 REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
+
+
+def _schedule_probe_retry(account_id: str) -> None:
+    def _worker() -> None:
+        time.sleep(max(0.0, REGISTER_PROBE_RETRY_SEC))
+        try:
+            import model_health
+
+            result = model_health.probe_single_account(
+                account_id,
+                None,
+                auto_disable=True,
+                source="register_retry",
+            )
+            print(
+                f"[grok-build-auth] delayed probe account={account_id} "
+                f"ok={bool(result.get('ok'))} [{ADAPTER_BUILD}]"
+            )
+        except Exception as retry_err:  # noqa: BLE001
+            print(
+                f"[grok-build-auth] delayed probe account={account_id} "
+                f"failed: {retry_err} [{ADAPTER_BUILD}]"
+            )
+
+    threading.Thread(
+        target=_worker,
+        name=f"register-probe-retry-{account_id[:8]}",
+        daemon=True,
+    ).start()
 
 
 def _now() -> float:
@@ -1725,9 +1755,6 @@ def _run_registration(
         _check_cancel()
 
         def _solve_turnstile(url: str, *, premium: bool = True) -> Any:
-            # Local inline solver is single-process and browser-backed; concurrent
-            # createTask storms from many registration workers cause timeouts /
-            # mixed results. Serialize local solves while keeping YesCaptcha parallel.
             kwargs = {
                 "website_url": url,
                 "website_key": sitekey,
@@ -1735,9 +1762,7 @@ def _run_registration(
                 "fallback_non_premium": True,
             }
             if provider == "local":
-                with _local_captcha_lock:
-                    _check_cancel()
-                    return solver.solve_turnstile(**kwargs)
+                _check_cancel()
             return solver.solve_turnstile(**kwargs)
 
         try:
@@ -2140,40 +2165,38 @@ def _run_registration(
         # Auto probe newly imported accounts so they are validated in the pool.
         probe_summaries: list[dict[str, Any]] = []
         if imported_ids:
-            delay = max(0.0, float(REGISTER_PROBE_DELAY_SEC or 0.0))
-            if delay > 0:
-                update(
-                    "probing",
-                    f"imported {len(imported_ids)} account(s); wait {int(delay)}s "
-                    f"before probe [{ADAPTER_BUILD}]",
-                    imported_account_ids=imported_ids,
-                    imported_accounts=imported_accounts,
-                    probe_delay_sec=delay,
-                )
-                time.sleep(delay)
             update(
                 "probing",
-                f"imported {len(imported_ids)} account(s); probing pool health "
-                f"(delay={int(delay)}s) [{ADAPTER_BUILD}]",
+                f"imported {len(imported_ids)} account(s); probing pool health now "
+                f"[{ADAPTER_BUILD}]",
                 imported_account_ids=imported_ids,
                 imported_accounts=imported_accounts,
-                probe_delay_sec=delay,
+                probe_delay_sec=0,
             )
             try:
                 import model_health
 
                 for aid in imported_ids:
                     try:
-                        pr = model_health.probe_single_account(
-                            aid, None, auto_disable=True, source="register"
+                        model = (
+                            model_health.PROBE_MODELS[0]
+                            if model_health.PROBE_MODELS
+                            else model_health.DEFAULT_MODEL
                         )
-                        detail = pr.get("result") if isinstance(pr, dict) else None
+                        creds = model_health.load_credentials_by_id(aid)
+                        detail = model_health.probe_model_for_creds(
+                            creds,
+                            model,
+                            auto_disable=False,
+                            source="register_initial",
+                            report_stats=False,
+                        )
                         if not isinstance(detail, dict):
-                            detail = pr if isinstance(pr, dict) else {}
+                            detail = {}
+                        probe_ok = bool(detail.get("available"))
                         err_text = (
                             detail.get("error")
                             or detail.get("message")
-                            or (pr.get("error") if isinstance(pr, dict) else None)
                             or ""
                         )
                         latency = (
@@ -2184,14 +2207,22 @@ def _run_registration(
                         probe_summaries.append(
                             {
                                 "account_id": aid,
-                                "ok": bool(pr.get("ok") if isinstance(pr, dict) else False),
+                                "ok": probe_ok,
                                 "model": detail.get("model")
-                                or (pr.get("model") if isinstance(pr, dict) else None),
+                                or model,
                                 "error": (str(err_text)[:180] if err_text else None),
                                 "latency_ms": latency,
+                                "retry_in_sec": (
+                                    None
+                                    if probe_ok
+                                    else int(REGISTER_PROBE_RETRY_SEC)
+                                ),
                             }
                         )
+                        if not probe_ok:
+                            _schedule_probe_retry(aid)
                     except Exception as pe:  # noqa: BLE001
+                        _schedule_probe_retry(aid)
                         probe_summaries.append(
                             {
                                 "account_id": aid,
@@ -2200,6 +2231,8 @@ def _run_registration(
                             }
                         )
             except Exception as pe:  # noqa: BLE001
+                for aid in imported_ids:
+                    _schedule_probe_retry(aid)
                 probe_summaries.append(
                     {
                         "account_id": None,
