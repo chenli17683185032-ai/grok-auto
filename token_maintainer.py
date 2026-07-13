@@ -196,6 +196,10 @@ def _worker() -> None:
     if _stop.wait(_startup_delay()):
         return
     while not _stop.is_set():
+        try:
+            quota_wait_maintenance_tick()
+        except Exception:
+            pass
         run_once(force=False)
         wait = _next_wait_seconds()
         # Wait either for interval or an admin-triggered wakeup
@@ -279,3 +283,9 @@ def status(*, light: bool = False) -> dict[str, Any]:
         out["min_remaining_sec"] = rem
         out["last"] = dict(_last_run) if _last_run else None
     return out
+
+
+def quota_wait_maintenance_tick() -> dict:
+    """Called by maintainer loop to re-probe free-usage waiting accounts."""
+    import account_pool
+    return account_pool.process_quota_probe_due(max_n=10)

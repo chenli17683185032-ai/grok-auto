@@ -29,6 +29,8 @@ _QUOTA_ERROR_RE = re.compile(
     r"("
     r"usage[_ -]?limit[_ -]?reached|"
     r"usage[_ -]?pool[_ -]?exhausted|"
+    r"free[_ -]?usage[_ -]?exhausted|"
+    r"subscription:free-usage-exhausted|"
     r"quota[_ -]?exceeded|"
     r"quota\s+exceeded|"
     r"run\s+out\s+of\s+credits|"
@@ -193,6 +195,74 @@ def _detect_billing_exhausted(
     return False, None
 
 
+
+def parse_quota_reset_at(headers: Any = None, *, body: str = "") -> float | None:
+    """Extract absolute reset time (epoch seconds) from headers or body if present."""
+    import time as _time
+    now = _time.time()
+    if headers is not None:
+        try:
+            # httpx Headers or dict
+            get = headers.get if hasattr(headers, "get") else lambda k, d=None: None
+            for key in (
+                "x-ratelimit-reset",
+                "x-ratelimit-reset-tokens",
+                "x-rate-limit-reset",
+                "x-rate-limit-reset-tokens",
+                "ratelimit-reset",
+                "x-grok-usage-reset",
+                "x-usage-reset-at",
+                "retry-after",
+            ):
+                raw = get(key) or get(key.title()) or get(key.upper())
+                if raw is None:
+                    continue
+                # HTTP-date Retry-After not fully parsed; numeric only here
+                try:
+                    val = float(str(raw).strip())
+                except (TypeError, ValueError):
+                    continue
+                if val > 1e12:  # epoch ms
+                    return val / 1000.0
+                if key.lower() == "retry-after" or val < 1e9:
+                    return now + max(0.0, val)
+                return val
+        except Exception:
+            pass
+    # body may include resetAt / reset_at ISO or epoch
+    import re as _re
+    m = _re.search(r'"reset[_-]?at"\s*:\s*"?(\d{10,13})"?', body or "", _re.I)
+    if m:
+        v = float(m.group(1))
+        if v > 1e12:
+            v /= 1000.0
+        return v
+    # default rolling 24h window
+    return now + 24 * 3600
+
+
+def is_free_usage_exhausted_message(error: str = "", status_code: int | None = None) -> bool:
+    text = (error or "").lower()
+    if "free-usage-exhausted" in text or "free_usage_exhausted" in text:
+        return True
+    if "subscription:free-usage-exhausted" in text:
+        return True
+    # Numeric remaining_tokens only if explicitly zero/negative with a limit
+    import re as _re
+    m_rem = _re.search(r"remaining[_-]?tokens\D+(\d+)", text)
+    m_lim = _re.search(r"limit[_-]?tokens\D+(\d+)", text)
+    if m_rem and m_lim:
+        try:
+            rem = int(m_rem.group(1))
+            lim = int(m_lim.group(1))
+            if lim > 0 and rem <= 0:
+                return True
+        except ValueError:
+            pass
+    # Do NOT treat bare "limit_tokens=1000000 remaining=500000" as exhausted.
+    return False
+
+
 def is_quota_error_message(error: str | None, status_code: int | None = None) -> bool:
     """True if upstream error indicates hard quota/credit exhaustion."""
     text = (error or "").strip()
@@ -242,14 +312,24 @@ def apply_exhaustion_to_pool(
     *,
     reason: str,
     source: str = "billing",
+    reset_at: float | None = None,
+    limit_tokens: int | float | None = None,
+    remaining_tokens: int | float | None = None,
 ) -> dict[str, Any] | None:
-    """Disable account in rotation pool when quota is gone."""
+    """Mark account quota_waiting (not permanent disable)."""
     if not account_id:
         return None
     try:
         import account_pool
 
-        return account_pool.disable_for_quota(account_id, reason=reason, source=source)
+        return account_pool.mark_quota_waiting(
+            account_id,
+            reason=reason,
+            source=source,
+            reset_at=reset_at,
+            limit_tokens=limit_tokens,
+            remaining_tokens=remaining_tokens,
+        )
     except Exception as e:  # noqa: BLE001
         return {"id": account_id, "error": str(e)}
 
@@ -260,22 +340,37 @@ def maybe_disable_from_quota_result(result: dict[str, Any]) -> dict[str, Any]:
         return result
     account_id = result.get("account_id")
     if result.get("exhausted"):
-        reason = result.get("exhaust_reason") or "额度已耗尽"
+        reason = result.get("exhaust_reason") or "额度已耗尽（等待24h重置）"
         disabled = apply_exhaustion_to_pool(
-            account_id, reason=reason, source="billing"
+            account_id,
+            reason=reason,
+            source="billing",
+            reset_at=result.get("reset_at"),
+            limit_tokens=result.get("limit_tokens"),
+            remaining_tokens=result.get("remaining_tokens"),
         )
-        result["auto_disabled"] = True
-        result["disabled_record"] = disabled
+        result["auto_disabled"] = False
+        result["quota_waiting"] = True
+        result["waiting_record"] = disabled
         result["display"] = dict(result.get("display") or {})
-        result["display"]["summary"] = f"额度耗尽 · 已移出轮询（{reason}）"
+        result["display"]["summary"] = f"额度等待重置 · 暂不轮询（{reason}）"
     else:
         result["auto_disabled"] = False
-        # Persist last known healthy quota snapshot on pool meta
+        result["quota_waiting"] = False
         if account_id:
             try:
                 import account_pool
 
                 account_pool.save_quota_snapshot(account_id, result)
+                # Monthly USD billing health must NOT clear free-usage 1M waiting.
+                # Only clear when caller sets free_usage_ok=True (token probe path).
+                meta_state = account_pool.get_account_pool_state().get(account_id) or {}
+                if (
+                    result.get("free_usage_ok")
+                    and (meta_state.get("quota_waiting") or meta_state.get("disabled_for_quota"))
+                ):
+                    account_pool.clear_quota_waiting(account_id, source="free_usage_ok")
+                    result["quota_recovered"] = True
             except Exception:
                 pass
     return result
@@ -286,15 +381,24 @@ def handle_upstream_error_for_quota(
     *,
     error: str = "",
     status_code: int | None = None,
+    headers: Any = None,
 ) -> dict[str, Any] | None:
     """
-    On upstream failure: if message indicates quota exhaustion,
-    permanently disable the account from rotation (not just cooldown).
+    On upstream failure: if message indicates free-usage/quota exhaustion,
+    mark quota_waiting until reset (default +24h). Never permanent delete.
     """
-    if not account_id or not is_quota_error_message(error, status_code):
+    if not account_id or not is_free_usage_exhausted_message(error, status_code):
         return None
-    reason = f"上游额度错误 (HTTP {status_code}): {(error or '')[:120]}"
-    return apply_exhaustion_to_pool(account_id, reason=reason, source="upstream_error")
+    reason = f"上游额度等待 (HTTP {status_code}): {(error or '')[:120]}"
+    reset_at = parse_quota_reset_at(headers, body=error or "")
+    return apply_exhaustion_to_pool(
+        account_id,
+        reason=reason,
+        source="upstream_error",
+        reset_at=reset_at,
+        limit_tokens=1_000_000,
+        remaining_tokens=0,
+    )
 
 
 def normalize_user(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -514,4 +618,155 @@ async def fetch_all_quotas(
         "total_monthly_limit": total_limit,
         "total_remaining": total_remaining,
         "accounts": results,
+    }
+
+
+def probe_free_usage_for_creds(
+    creds: GrokCredentials,
+    *,
+    proxy: str | None = None,
+    timeout: float | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Production Grok Build 1M/24h free-usage probe via POST /responses.
+
+    Never logs Authorization or cookies. Uses explicit proxy without env mutation.
+    """
+    import re as _re
+    t_out = float(timeout if timeout is not None else _QUOTA_TIMEOUT)
+    use_model = (model or DEFAULT_MODEL or "grok-4.5").strip()
+    url = f"{UPSTREAM_BASE}/responses"
+    headers = _headers(creds.token)
+    # Prefer chat-completions style if responses unavailable — still same host/v1
+    body = {
+        "model": use_model,
+        "input": [{"role": "user", "content": "ping"}],
+        "max_output_tokens": 8,
+    }
+    # Also support chat/completions shape as fallback endpoint
+    chat_body = {
+        "model": use_model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 8,
+        "stream": False,
+    }
+    base: dict[str, Any] = {
+        "ok": False,
+        "free_usage_ok": False,
+        "exhausted": False,
+        "inconclusive": True,
+        "status_code": None,
+        "limit_tokens": None,
+        "remaining_tokens": None,
+        "actual_tokens": None,
+        "reset_at": None,
+        "error_class": "",
+        "account_id": creds.auth_key,
+        "source": "free_usage_probe",
+    }
+    client_kwargs: dict[str, Any] = {"timeout": t_out, "trust_env": False}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+    try:
+        with httpx.Client(**client_kwargs) as client:
+            resp = client.post(url, headers=headers, json=body)
+            # Fallback if /responses not found
+            if resp.status_code in (404, 405):
+                resp = client.post(
+                    f"{UPSTREAM_BASE}/chat/completions",
+                    headers=headers,
+                    json=chat_body,
+                )
+    except httpx.TimeoutException:
+        return {**base, "error_class": "timeout", "inconclusive": True}
+    except httpx.HTTPError as e:
+        return {**base, "error_class": f"network:{type(e).__name__}", "inconclusive": True}
+
+    status = int(resp.status_code)
+    base["status_code"] = status
+    text = (resp.text or "")[:2000]
+    # headers
+    def _hi(name: str):
+        try:
+            v = resp.headers.get(name) or resp.headers.get(name.title())
+            return int(float(v)) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    limit_tokens = _hi("x-ratelimit-limit-tokens")
+    remaining_tokens = _hi("x-ratelimit-remaining-tokens")
+    base["limit_tokens"] = limit_tokens
+    base["remaining_tokens"] = remaining_tokens
+    base["reset_at"] = parse_quota_reset_at(resp.headers, body=text)
+
+    # explicit exhaustion patterns
+    low = text.lower()
+    m_al = _re.search(r"tokens\s*\(actual/limit\)\s*:\s*(\d+)\s*/\s*(\d+)", text, _re.I)
+    if m_al:
+        actual, lim = int(m_al.group(1)), int(m_al.group(2))
+        base["actual_tokens"] = actual
+        base["limit_tokens"] = base["limit_tokens"] or lim
+        base["remaining_tokens"] = max(0, lim - actual)
+    exhausted = is_free_usage_exhausted_message(text, status)
+    if not exhausted and m_al:
+        actual, lim = int(m_al.group(1)), int(m_al.group(2))
+        if lim > 0 and actual >= lim:
+            exhausted = True
+    if not exhausted and remaining_tokens is not None and limit_tokens is not None:
+        if limit_tokens > 0 and remaining_tokens <= 0:
+            exhausted = True
+
+    if status in (401, 403) and not exhausted:
+        return {
+            **base,
+            "ok": False,
+            "inconclusive": False,
+            "error_class": "credential",
+            "exhausted": False,
+            "free_usage_ok": False,
+        }
+
+    if exhausted:
+        return {
+            **base,
+            "ok": True,
+            "inconclusive": False,
+            "exhausted": True,
+            "free_usage_ok": False,
+            "error_class": "free_usage_exhausted",
+            "limit_tokens": base["limit_tokens"] or 1_000_000,
+            "remaining_tokens": 0,
+        }
+
+    if 200 <= status < 300:
+        return {
+            **base,
+            "ok": True,
+            "inconclusive": False,
+            "exhausted": False,
+            "free_usage_ok": True,
+            "error_class": "",
+        }
+
+    if status == 429 and not exhausted:
+        return {
+            **base,
+            "ok": False,
+            "inconclusive": True,
+            "error_class": "rate_limited",
+        }
+
+    if status >= 500:
+        return {
+            **base,
+            "ok": False,
+            "inconclusive": True,
+            "error_class": f"upstream_{status}",
+        }
+
+    return {
+        **base,
+        "ok": False,
+        "inconclusive": True,
+        "error_class": f"http_{status}",
     }

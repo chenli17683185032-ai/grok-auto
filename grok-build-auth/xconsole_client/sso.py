@@ -283,7 +283,7 @@ class SSOExtractor:
         if token:
             if self.debug:
                 print("  [sso] found raw sso token in RSC body")
-            if save or email:
+            if save:
                 path = save_sso(
                     token, email=email, password=password, output_dir=output_dir
                 )
@@ -396,7 +396,7 @@ class SSOExtractor:
             token = parse_sso_from_set_cookies(set_cookies or []) or self._read_sso_from_jar()
 
         # 5. persist if requested
-        if token and (save or email):
+        if token and save:
             path = save_sso(token, email=email, password=password,
                             output_dir=output_dir)
             if self.debug:

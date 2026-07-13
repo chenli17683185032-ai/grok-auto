@@ -100,6 +100,17 @@ def _iter_entries(data: dict[str, Any]) -> list[tuple[str, dict[str, Any], float
     for key, value in data.items():
         if not isinstance(value, dict):
             continue
+        # A refresh token that the OIDC endpoint has permanently rejected is
+        # an account-wide terminal state.  Do not keep serving requests with
+        # its still-unexpired access token: that only adds latency/failover and
+        # lets a dead account remain in round-robin until the JWT expires.
+        if value.get("refresh_invalid"):
+            # Keep serving while access token is still unexpired; only exclude when
+            # access is gone/expired so a single refresh failure is not fatal.
+            tok = value.get("key") or value.get("access_token") or value.get("token")
+            exp = parse_expires_at(value.get("expires_at"), tok if isinstance(tok, str) else None)
+            if not tok or (exp is not None and float(exp) <= time.time() + 60):
+                continue
         token = value.get("key") or value.get("access_token") or value.get("token")
         if not token or not isinstance(token, str):
             continue

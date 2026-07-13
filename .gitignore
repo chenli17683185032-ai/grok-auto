@@ -24,3 +24,12 @@ data/register_sso/
 # Local deploy overrides (ports, domains, secrets paths)
 docker-compose.override.yml
 grokcli-2api.env
+
+# Local test outputs / untrusted review trees (never commit secrets)
+test-output/
+artifacts/
+_compare_grok_register/
+
+.venv311/
+
+.venv_sys/

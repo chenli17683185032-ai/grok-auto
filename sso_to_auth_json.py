@@ -18,15 +18,19 @@
 环境变量:
   GROK2API_AUTH_FILE  - 导入目标 auth.json（默认项目 data/auth.json）
   GROK2API_PROXY      - 代理地址，例如 http://127.0.0.1:7890
+  GROK2API_RUYIPAGE_APPROVERS - 多个无头审批 sidecar URL，逗号分隔并轮询
+  GROK2API_RUYIPAGE_APPROVER  - 单 sidecar URL（向后兼容）
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import secrets
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -34,8 +38,12 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from curl_cffi import requests
+try:
+    from curl_cffi import requests
+except ImportError:  # pragma: no cover - optional for unit tests without network stack
+    requests = None  # type: ignore
 
 # Use project config when available, otherwise fall back to defaults
 try:
@@ -52,6 +60,9 @@ except Exception:  # pragma: no cover - standalone fallback
 
 AUTH_KEY = f"{OIDC_ISSUER}::{GROK_CLI_CLIENT_ID}"
 
+_approver_rotation_lock = threading.Lock()
+_approver_rotation_index = 0
+
 
 def _proxy_kwargs() -> dict:
     """Return curl_cffi compatible proxy kwargs from env."""
@@ -59,6 +70,14 @@ def _proxy_kwargs() -> dict:
     if proxy:
         return {"proxies": {"http": proxy, "https": proxy}}
     return {}
+
+def _open_url(req: urllib.request.Request, *, timeout: float = 15, proxy: str | None = None):
+    """urlopen with optional per-call proxy (does not mutate process env)."""
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+        opener = urllib.request.build_opener(handler)
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -81,7 +100,8 @@ def rfc3339_ns(ts: float | None = None) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
 
 
-def request_device_code() -> dict | None:
+def request_device_code(*, proxy: str | None = None) -> dict | None:
+    """Request OAuth device code; optional per-call proxy for route sticky."""
     data = urllib.parse.urlencode({"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}).encode()
     req = urllib.request.Request(
         f"{OIDC_ISSUER}/oauth2/device/code",
@@ -90,10 +110,19 @@ def request_device_code() -> dict | None:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _open_url(req, timeout=15, proxy=proxy) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        print(f"  ❌ device/code HTTP {e.code}: {e.read().decode()[:200]}")
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            body = ""
+        print(f"  ❌ device/code HTTP {e.code}")
+        # never print body — may contain secrets
+        _ = body
+        return None
+    except Exception as e:
+        print(f"  ❌ device/code network: {type(e).__name__}")
         return None
 
 
@@ -131,15 +160,286 @@ def poll_token(device_code: str, interval: int, expires_in: int, timeout: int = 
     return None
 
 
-def sso_to_token(sso_cookie: str) -> dict | None:
-    """SSO cookie → token dict (access/refresh/expires_in)"""
+
+def _configured_approver_endpoints() -> tuple[str, ...]:
+    """Return configured sidecars, preferring the comma-separated plural setting."""
+    raw = os.getenv("GROK2API_RUYIPAGE_APPROVERS", "").strip()
+    if not raw:
+        raw = os.getenv("GROK2API_RUYIPAGE_APPROVER", "").strip()
+
+    endpoints: list[str] = []
+    seen: set[str] = set()
+    for value in raw.replace(";", ",").replace("\n", ",").split(","):
+        endpoint = value.strip().rstrip("/")
+        if endpoint and endpoint not in seen:
+            seen.add(endpoint)
+            endpoints.append(endpoint)
+    return tuple(endpoints)
+
+
+def _approver_endpoints_for_flow() -> tuple[str, ...]:
+    """Choose one sidecar round-robin and retain the others as failover targets."""
+    global _approver_rotation_index
+
+    endpoints = _configured_approver_endpoints()
+    if len(endpoints) < 2:
+        return endpoints
+    with _approver_rotation_lock:
+        start = _approver_rotation_index % len(endpoints)
+        _approver_rotation_index = (start + 1) % len(endpoints)
+    return endpoints[start:] + endpoints[:start]
+
+
+def _try_lock_approver(endpoint: str):
+    """Reserve one sidecar across API/producer/recovery containers.
+
+    All three services bind-mount the same ``/app/data`` directory.  An
+    advisory lock per endpoint prevents two Device Flows from driving the same
+    browser at once without reducing the two-sidecar pool to one global slot.
+    The kernel releases the lease automatically if a worker crashes.
+    """
+    lock_dir = Path(
+        os.getenv("GROK2API_APPROVER_LOCK_DIR", "/app/data/approver_locks")
+    )
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_name = hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:24] + ".lock"
+    handle = open(lock_dir / lock_name, "a+b")
+    try:
+        if os.name == "nt":  # pragma: no cover - server deployment is Linux
+            import msvcrt
+
+            handle.seek(0)
+            if handle.read(1) == b"":
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except (OSError, BlockingIOError):
+        handle.close()
+        return None
+
+
+def _unlock_approver(handle) -> None:
+    try:
+        if os.name == "nt":  # pragma: no cover - server deployment is Linux
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        handle.close()
+
+
+def browser_approve_device(
+    sso_cookie: str,
+    dc: dict,
+    *,
+    approver_endpoint: str | None = None,
+    sticky: bool = False,
+    cookie_bundle_path: str = "",
+    cookie_mode: str = "sso_only",
+    extra_cookies: list | None = None,
+) -> dict | None:
+    """Approve one Device Flow on one free sidecar.
+
+    Transport failures may fail over to another sidecar **unless** sticky=True
+    (route affinity): then only the pinned endpoint is used and a structured
+    business denial is never replayed elsewhere.
+    """
+    if approver_endpoint:
+        endpoints = (approver_endpoint.rstrip("/"),)
+    else:
+        endpoints = _approver_endpoints_for_flow()
+    if not endpoints:
+        return None
+    timeout = int(os.getenv("GROK2API_RUYIPAGE_TIMEOUT", "120"))
+    lock_wait = max(
+        0.0, float(os.getenv("GROK2API_APPROVER_LOCK_WAIT_SEC", str(timeout + 30)))
+    )
+    lock_poll = max(
+        0.05, float(os.getenv("GROK2API_APPROVER_LOCK_POLL_SEC", "0.25"))
+    )
+    body: dict[str, Any] = {
+        "sso": sso_cookie,
+        "verification_url": dc.get("verification_uri_complete") or dc.get("verification_uri"),
+        "user_code": dc.get("user_code", ""),
+        "timeout": timeout,
+        "cookie_mode": cookie_mode or "sso_only",
+    }
+    if cookie_bundle_path:
+        # Path only — approver reads file itself if volume mounted.
+        body["cookie_bundle_path"] = cookie_bundle_path
+    if extra_cookies:
+        # Inline allow-listed cookies so approver works without shared FS.
+        body["extra_cookies"] = extra_cookies
+    payload = json.dumps(body).encode()
+    remaining = list(endpoints)
+    deadline = time.monotonic() + lock_wait
+    while remaining:
+        saw_busy = False
+        for endpoint in tuple(remaining):
+            lease = _try_lock_approver(endpoint)
+            if lease is None:
+                saw_busy = True
+                continue
+            try:
+                req = urllib.request.Request(
+                    endpoint + "/approve",
+                    data=payload,
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=timeout + 30) as resp:
+                        result = json.loads(resp.read())
+                    if not isinstance(result, dict):
+                        raise ValueError("invalid non-object response")
+                except Exception as e:
+                    print(f"  ❌ ruyiPage approve 异常 ({endpoint}): {type(e).__name__}")
+                    remaining.remove(endpoint)
+                    if remaining and not sticky:
+                        print("  ↪️ 切换下一个 ruyiPage sidecar")
+                    continue
+                # Structured business result (ok/denied/timeout/rate_limited) is final
+                # for this Device Code — never cross-route replay.
+                result.setdefault("approver_endpoint", endpoint)
+                return result
+            finally:
+                _unlock_approver(lease)
+
+        if sticky or not saw_busy or time.monotonic() >= deadline:
+            break
+        time.sleep(min(lock_poll, max(0.0, deadline - time.monotonic())))
+
+    if remaining:
+        print("  ⏳ 所有 ruyiPage sidecar 忙，等待租约超时")
+        return {"ok": False, "busy": True, "error": "busy"}
+    # Preserve the legacy HTTP fallback only when every configured sidecar was
+    # unreachable or returned malformed transport data.
+    return None
+
+
+
+def poll_token_cancellable(
+    device_code: str,
+    interval: int,
+    expires_in: int,
+    timeout: int = 60,
+    *,
+    cancel: threading.Event | None = None,
+    proxy: str | None = None,
+) -> dict | None:
+    """Token poll that honours cancel + optional per-call proxy for route sticky."""
+    deadline = time.time() + min(expires_in, timeout)
+    current_interval = max(1, int(interval or 5))
+    while time.time() < deadline:
+        if cancel is not None and cancel.is_set():
+            print("  ⏹ token poll cancelled")
+            return None
+        time.sleep(current_interval)
+        if cancel is not None and cancel.is_set():
+            return None
+        data = urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": GROK_CLI_CLIENT_ID,
+                "device_code": device_code,
+            }
+        ).encode()
+        req = urllib.request.Request(
+            f"{OIDC_ISSUER}/oauth2/token",
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with _open_url(req, timeout=15, proxy=proxy) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                err = json.loads(e.read())
+            except Exception:
+                err = {}
+            error = err.get("error", "")
+            if error == "authorization_pending":
+                continue
+            if error == "slow_down":
+                current_interval += 5
+                continue
+            if error in ("access_denied", "expired_token"):
+                print(f"  ❌ token: {error}")
+                return None
+            print(f"  ❌ token: {error or e.code}")
+            return None
+        except Exception as e:
+            print(f"  ❌ token poll network: {type(e).__name__}")
+            return None
+    print("  ❌ 轮询超时")
+    return None
+
+
+def sso_to_token(
+    sso_cookie: str,
+    _attempt: int = 0,
+    *,
+    route_id: str | None = None,
+    approver_endpoint: str | None = None,
+    proxy: str | None = None,
+    cookie_bundle_path: str = "",
+    cookie_mode: str = "sso_only",
+    parallel_poll: bool | None = None,
+    extra_cookies: list | None = None,
+) -> dict | None:
+    """SSO cookie → token dict (access/refresh/expires_in).
+
+    Optional kwargs enable route affinity / cookie bundle / parallel poll.
+    When omitted, behaviour matches the legacy serial path.
+    Proxy is applied per-call (curl_cffi proxies= + urllib ProxyHandler),
+    never via mutating process-global env under concurrency.
+    """
+    sticky = bool(route_id or approver_endpoint)
+    if sticky and not approver_endpoint and route_id:
+        try:
+            from route_registry import get_registry
+
+            approver_endpoint = get_registry().approver_for(route_id)
+            if not proxy:
+                proxy = get_registry().proxy_for(route_id, "token")
+        except Exception:
+            pass
+
+    session_proxy_kwargs: dict = {}
+    if proxy:
+        session_proxy_kwargs = {"proxies": {"http": proxy, "https": proxy}}
+    else:
+        session_proxy_kwargs = _proxy_kwargs()
+
+    if requests is None:
+        print("  ❌ curl_cffi not installed")
+        return None
     s = requests.Session()
     s.cookies.set("sso", sso_cookie, domain=".x.ai")
 
     try:
-        r = s.get("https://accounts.x.ai/", impersonate="chrome", timeout=15, **_proxy_kwargs())
+        r = s.get(
+            "https://accounts.x.ai/",
+            impersonate="chrome",
+            timeout=15,
+            **session_proxy_kwargs,
+        )
     except Exception as e:
-        print(f"  ❌ 网络错误: {e}")
+        print(f"  ❌ 网络错误: {type(e).__name__}")
         return None
     if "sign-in" in r.url or "sign-up" in r.url:
         print("  ❌ sso 无效")
@@ -147,64 +447,155 @@ def sso_to_token(sso_cookie: str) -> dict | None:
     print("  ✅ sso 有效")
 
     print("  🔑 Device Flow...")
-    dc = request_device_code()
+    dc = request_device_code(proxy=proxy)
     if not dc:
         return None
     print(f"  📋 user_code: {dc.get('user_code')}")
 
-    try:
-        s.get(dc["verification_uri_complete"], impersonate="chrome", timeout=15, **_proxy_kwargs())
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/verify",
-            data={"user_code": dc["user_code"]},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
-            **_proxy_kwargs(),
+    use_parallel = (
+        parallel_poll
+        if parallel_poll is not None
+        else os.getenv("GROK2API_PARALLEL_TOKEN_POLL", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
+    cancel = threading.Event()
+    poll_holder: dict[str, Any] = {"token": None, "done": False}
+
+    def _poll_worker() -> None:
+        poll_holder["token"] = poll_token_cancellable(
+            dc["device_code"],
+            dc.get("interval", 5),
+            dc.get("expires_in", 1800),
+            cancel=cancel,
+            proxy=proxy,
         )
-        if "consent" not in r.url:
-            print(f"  ❌ verify 失败: {r.url}")
-            return None
-    except Exception as e:
-        print(f"  ❌ verify 异常: {e}")
-        return None
+        poll_holder["done"] = True
+
+    poll_thread: threading.Thread | None = None
+    if use_parallel:
+        poll_thread = threading.Thread(
+            target=_poll_worker, name="token-poll", daemon=True
+        )
+        poll_thread.start()
 
     try:
-        r = s.post(
-            f"{OIDC_ISSUER}/oauth2/device/approve",
-            data={
-                "user_code": dc["user_code"],
-                "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=15,
-            allow_redirects=True,
-            **_proxy_kwargs(),
+        browser_result = browser_approve_device(
+            sso_cookie,
+            dc,
+            approver_endpoint=approver_endpoint,
+            sticky=sticky,
+            cookie_bundle_path=cookie_bundle_path,
+            cookie_mode=cookie_mode,
+            extra_cookies=extra_cookies,
         )
-        if "done" not in r.url:
-            print(f"  ❌ approve 失败: {r.url}")
-            return None
-        print("  ✅ 授权确认")
-    except Exception as e:
-        print(f"  ❌ approve 异常: {e}")
-        return None
+        if browser_result is not None:
+            if not browser_result.get("ok"):
+                # Cancel parallel poll on structured failure
+                cancel.set()
+                if poll_thread is not None:
+                    poll_thread.join(timeout=2)
+                # Never cross-route replay a structured denial
+                print(f"  ❌ ruyiPage approve 失败: ok=false keys={sorted(browser_result.keys())}")
+                if browser_result.get("rate_limited") and _attempt < 3:
+                    delay = (30, 60, 120)[_attempt]
+                    print(f"  ⏳ Device Flow 限流，{delay}s 后申请新 Device Code 重试")
+                    time.sleep(delay)
+                    return sso_to_token(
+                        sso_cookie,
+                        _attempt + 1,
+                        route_id=route_id,
+                        approver_endpoint=approver_endpoint,
+                        proxy=proxy,
+                        cookie_bundle_path=cookie_bundle_path,
+                        cookie_mode=cookie_mode,
+                        parallel_poll=use_parallel,
+                    )
+                return None
+            print("  ✅ ruyiPage 无头浏览器授权确认")
+        else:
+            if sticky:
+                # No HTTP fallback cross-route when sticky; fail this attempt.
+                cancel.set()
+                if poll_thread is not None:
+                    poll_thread.join(timeout=2)
+                print("  ❌ sticky route approver unavailable")
+                return None
+            try:
+                s.get(
+                    dc["verification_uri_complete"],
+                    impersonate="chrome",
+                    timeout=15,
+                    **session_proxy_kwargs,
+                )
+                r = s.post(
+                    f"{OIDC_ISSUER}/oauth2/device/verify",
+                    data={"user_code": dc["user_code"]},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=15,
+                    allow_redirects=True,
+                    **session_proxy_kwargs,
+                )
+                if "consent" not in r.url:
+                    print("  ❌ verify 失败")
+                    cancel.set()
+                    return None
+                r = s.post(
+                    f"{OIDC_ISSUER}/oauth2/device/approve",
+                    data={
+                        "user_code": dc["user_code"],
+                        "action": "allow",
+                        "principal_type": "User",
+                        "principal_id": "",
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    impersonate="chrome",
+                    timeout=15,
+                    allow_redirects=True,
+                    **session_proxy_kwargs,
+                )
+                if "done" not in r.url:
+                    print("  ❌ approve 失败")
+                    cancel.set()
+                    return None
+                print("  ✅ HTTP 授权确认")
+            except Exception as e:
+                print(f"  ❌ HTTP approve 异常: {type(e).__name__}")
+                cancel.set()
+                return None
 
-    token = poll_token(
-        dc["device_code"],
-        dc.get("interval", 5),
-        dc.get("expires_in", 1800),
-    )
-    if not token:
-        return None
-    print(
-        f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-        + (" + refresh_token" if token.get("refresh_token") else "")
-    )
-    return token
+        if use_parallel and poll_thread is not None:
+            poll_thread.join(
+                timeout=float(os.getenv("GROK2API_TOKEN_POLL_JOIN_SEC", "90") or 90)
+            )
+            token = poll_holder.get("token")
+            if not token:
+                token = poll_token_cancellable(
+                    dc["device_code"],
+                    dc.get("interval", 5),
+                    dc.get("expires_in", 1800),
+                    timeout=30,
+                    proxy=proxy,
+                )
+        else:
+            token = poll_token_cancellable(
+                dc["device_code"],
+                dc.get("interval", 5),
+                dc.get("expires_in", 1800),
+                proxy=proxy,
+            )
+        if not token:
+            return None
+        print(
+            f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+            + (" + refresh_token" if token.get("refresh_token") else "")
+        )
+        return token
+    finally:
+        # Always cancel background poller on exit paths that return early after start.
+        if use_parallel:
+            cancel.set()
 
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
@@ -249,8 +640,15 @@ def write_auth_json(path: Path, auth_key: str, entry: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {auth_key: entry}
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(_fd, "w", encoding="utf-8") as _fh:
+        _fh.write(_payload)
     os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def merge_auth_json(path: Path, auth_key: str, entry: dict, unique: bool = True) -> None:
@@ -269,8 +667,15 @@ def merge_auth_json(path: Path, auth_key: str, entry: dict, unique: bool = True)
         key = f"{auth_key}::{entry['user_id']}"
     existing[key] = entry
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(existing, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _payload = json.dumps(existing, indent=2, ensure_ascii=False) + "\n"
+    _fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(_fd, "w", encoding="utf-8") as _fh:
+        _fh.write(_payload)
     os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def import_into_project_auth(entry: dict) -> str:

@@ -16,3 +16,4 @@ vendors
 **/oauth_output
 **/accounts_output
 **/cliproxyapi_auth
+integrations/

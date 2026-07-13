@@ -185,11 +185,17 @@ def read_auth_map(path: Path | None = None) -> dict[str, Any]:
 
 def write_auth_map(data: dict[str, Any], path: Path | None = None) -> None:
     path = path or AUTH_FILE
+    try:
+        migrate_auth_permissions(path)
+    except Exception:
+        pass
     with auth_lock():
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
         payload = _dump_json(data)
-        tmp.write_text(payload, encoding="utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
         # Windows: replace may fail if dest open; retry briefly
         last_err: Exception | None = None
         for _ in range(8):
@@ -207,6 +213,11 @@ def write_auth_map(data: dict[str, Any], path: Path | None = None) -> None:
                 if tmp.exists():
                     tmp.unlink()
             raise last_err
+        try:
+            os.chmod(path, 0o600)
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
         _set_cache(path, data if isinstance(data, dict) else {}, _path_mtime_ns(path))
 
 
@@ -228,7 +239,40 @@ def mutate_auth_map(mutator) -> dict[str, Any]:
         mutator(data)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-        tmp.write_text(_dump_json(data), encoding="utf-8")
+        payload = _dump_json(data)
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
         os.replace(str(tmp), str(path))
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
         _set_cache(path, data, _path_mtime_ns(path))
         return data
+
+
+def migrate_auth_permissions(path: Path | None = None) -> dict[str, int]:
+    """Idempotent: chmod auth.json and auth.bak.* to 0600; parent 0700. No content change."""
+    path = path or AUTH_FILE
+    fixed = skipped = failed = 0
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        failed += 1
+    targets = []
+    if path.exists():
+        targets.append(path)
+    try:
+        targets.extend(sorted(path.parent.glob(path.name + ".bak*")))
+        targets.extend(sorted(path.parent.glob("auth.bak.*")))
+    except OSError:
+        pass
+    for fp in targets:
+        try:
+            os.chmod(fp, 0o600)
+            fixed += 1
+        except OSError:
+            failed += 1
+    return {"fixed": fixed, "skipped": skipped, "failed": failed}

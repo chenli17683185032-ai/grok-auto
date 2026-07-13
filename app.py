@@ -1745,7 +1745,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             code = e.response.status_code if e.response is not None else 502
             detail = e.response.text[:800] if e.response is not None else str(e)
             account_pool.report_failure(
-                creds.auth_key, error=detail, status_code=code, model=model
+                creds.auth_key,
+                error=detail,
+                status_code=code,
+                model=model,
+                headers=getattr(e.response, "headers", None) if e.response is not None else None,
             )
             last_error = f"Upstream {code}: {detail}"
             last_status = code
@@ -2611,7 +2615,11 @@ async def anthropic_messages(
             code = e.response.status_code if e.response is not None else 502
             detail = e.response.text[:800] if e.response is not None else str(e)
             account_pool.report_failure(
-                creds.auth_key, error=detail, status_code=code, model=model
+                creds.auth_key,
+                error=detail,
+                status_code=code,
+                model=model,
+                headers=getattr(e.response, "headers", None) if e.response is not None else None,
             )
             last_error = f"Upstream {code}: {detail}"
             last_status = code

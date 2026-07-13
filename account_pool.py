@@ -51,6 +51,11 @@ def _pool_meta(account_id: str, state: dict[str, Any]) -> dict[str, Any]:
         "last_error": meta.get("last_error"),
         "cooldown_until": meta.get("cooldown_until"),
         "disabled_for_quota": bool(meta.get("disabled_for_quota")),
+        "quota_waiting": bool(meta.get("quota_waiting") or meta.get("disabled_for_quota")),
+        "quota_status": meta.get("quota_status")
+        or ("quota_waiting" if meta.get("quota_waiting") or meta.get("disabled_for_quota") else "active"),
+        "quota_reset_at": meta.get("quota_reset_at"),
+        "quota_wait_reason": meta.get("quota_wait_reason") or meta.get("disabled_reason"),
         "disabled_reason": meta.get("disabled_reason"),
         "quota_disabled_at": meta.get("quota_disabled_at"),
         "quota_source": meta.get("quota_source"),
@@ -80,6 +85,43 @@ def is_in_cooldown(meta: dict[str, Any]) -> bool:
         return _now() < float(until)
     except (TypeError, ValueError):
         return False
+
+
+def is_quota_waiting(meta: dict[str, Any], *, now: float | None = None) -> bool:
+    """True while account is in rolling free-usage wait (not permanently dead)."""
+    if not meta.get("quota_waiting") and not meta.get("disabled_for_quota"):
+        return False
+    # Legacy disabled_for_quota without waiting flag still treated as waiting if reset known
+    if meta.get("quota_waiting") is False and meta.get("disabled_for_quota"):
+        # old permanent path — still exclude from rotation but do not delete until grace
+        return True
+    return bool(meta.get("quota_waiting") or meta.get("disabled_for_quota"))
+
+
+def quota_probe_due(meta: dict[str, Any], *, now: float | None = None) -> bool:
+    current = time.time() if now is None else now
+    if not is_quota_waiting(meta, now=current):
+        return False
+    reset_at = meta.get("quota_reset_at")
+    try:
+        reset_at_f = float(reset_at) if reset_at is not None else 0.0
+    except (TypeError, ValueError):
+        reset_at_f = 0.0
+    next_probe = meta.get("quota_next_probe_at")
+    try:
+        next_probe_f = float(next_probe) if next_probe is not None else 0.0
+    except (TypeError, ValueError):
+        next_probe_f = 0.0
+    if next_probe_f and current < next_probe_f:
+        return False
+    # Due if past reset or no reset known but wait started long enough ago
+    if reset_at_f and current >= reset_at_f:
+        return True
+    if not reset_at_f:
+        started = float(meta.get("quota_waiting_since") or meta.get("quota_disabled_at") or 0)
+        # probe every 30m if no reset_at
+        return current - started >= 1800.0
+    return False
 
 
 def list_pool_accounts() -> list[dict[str, Any]]:
@@ -131,6 +173,8 @@ def _eligible(
     if not meta["enabled"]:
         return False
     if is_in_cooldown(meta):
+        return False
+    if is_quota_waiting(meta):
         return False
     if model and is_model_blocked(aid, model, state):
         return False
@@ -218,11 +262,13 @@ def acquire(
     # If everything is cooling down, relax cooldown and still try
     # (but still respect model blocks + enabled)
     if not eligible:
+        # Relax cooldown only — NEVER schedule quota_waiting / permanently blocked.
         eligible = [
             c
             for c in candidates
             if not c.expired
             and _pool_meta(c.auth_key or "", state)["enabled"]
+            and not is_quota_waiting(_pool_meta(c.auth_key or "", state))
             and not (model and is_model_blocked(c.auth_key or "", model, state))
         ]
     if not eligible:
@@ -258,6 +304,7 @@ def report_failure(
     status_code: int | None = None,
     cooldown: float | None = None,
     model: str | None = None,
+    headers: Any = None,
 ) -> None:
     if not account_id:
         return
@@ -280,7 +327,7 @@ def report_failure(
         from quota import handle_upstream_error_for_quota
 
         handle_upstream_error_for_quota(
-            account_id, error=error, status_code=status_code
+            account_id, error=error, status_code=status_code, headers=headers
         )
     except Exception:
         pass
@@ -392,40 +439,167 @@ def unblock_model(account_id: str, model: str | None = None) -> dict[str, Any] |
     return {"id": account_id, "blocked_models": meta.get("blocked_models") or {}}
 
 
-def disable_for_quota(
+def mark_quota_waiting(
     account_id: str,
     *,
-    reason: str = "额度已耗尽",
-    source: str = "billing",
+    reason: str = "额度已耗尽（滚动24h等待）",
+    source: str = "upstream",
+    reset_at: float | None = None,
+    limit_tokens: int | float | None = None,
+    remaining_tokens: int | float | None = None,
 ) -> dict[str, Any] | None:
-    """Disable account permanently from rotation due to quota exhaustion."""
+    """Put account into quota_waiting — NOT permanently dead.
+
+    Account stays out of rotation until reset_at / re-probe confirms recovery.
+    Must never be treated as delete-eligible solely for this state.
+    """
     state = get_account_pool_state()
     meta = state.get(account_id) or {}
     if not isinstance(meta, dict):
         meta = {}
-    already = meta.get("enabled") is False and meta.get("disabled_for_quota")
-    meta["enabled"] = False
-    meta["disabled_for_quota"] = True
-    meta["disabled_reason"] = (reason or "额度已耗尽")[:300]
-    meta["quota_disabled_at"] = _now()
+    now = _now()
+    already = bool(meta.get("quota_waiting"))
+    meta["quota_waiting"] = True
+    # Do not flip manual disabled -> enabled. Rotation uses is_quota_waiting.
+    if meta.get("enabled") is not False:
+        meta["enabled"] = True
+    meta["disabled_for_quota"] = False  # waiting is not permanent quota death
+    meta["disabled_reason"] = ""
+    meta["quota_wait_reason"] = (reason or "额度已耗尽")[:300]
+    # Same-cycle exhaustion must NOT extend reset_at with a fresh now+24h.
+    already_waiting = bool(meta.get("quota_waiting"))
+    if not already_waiting:
+        meta["quota_waiting_since"] = now
+        meta["quota_cycle_id"] = f"qc_{int(now)}"
+        meta["quota_grace_count"] = 0
+        meta["quota_confirmation_count"] = 0
     meta["quota_source"] = source
-    meta["last_error"] = meta["disabled_reason"]
+    meta["last_error"] = meta["quota_wait_reason"]
+    if reset_at is not None:
+        try:
+            new_reset = float(reset_at)
+        except (TypeError, ValueError):
+            new_reset = None
+        # Authoritative header may set/shorten reset; never push later via fallback alone
+        if new_reset is not None:
+            old_reset = float(meta.get("quota_reset_at") or 0) or None
+            if not already_waiting or old_reset is None or new_reset < old_reset:
+                meta["quota_reset_at"] = new_reset
+    elif not already_waiting:
+        meta["quota_reset_at"] = now + 24 * 3600
+    # else: keep existing quota_reset_at
+    if limit_tokens is not None:
+        meta["quota_limit_tokens"] = limit_tokens
+    if remaining_tokens is not None:
+        meta["quota_remaining_tokens"] = remaining_tokens
+    # Next probe at reset_at (or +30m)
+    meta["quota_next_probe_at"] = float(meta.get("quota_reset_at") or (now + 1800))
+    meta["quota_status"] = "quota_waiting"
     state[account_id] = meta
     save_account_pool_state(state)
     if not already:
         print(
-            f"  [quota] account disabled from pool: "
-            f"{account_id} — {meta['disabled_reason']}"
+            f"  [quota] account waiting for reset: "
+            f"{account_id} — {meta['quota_wait_reason']} "
+            f"reset_at={meta.get('quota_reset_at')}"
         )
     for a in list_pool_accounts():
         if a["id"] == account_id:
             return a
     return {
         "id": account_id,
-        "enabled": False,
-        "disabled_for_quota": True,
-        "disabled_reason": meta["disabled_reason"],
+        "enabled": True,
+        "quota_waiting": True,
+        "disabled_for_quota": False,
+        "quota_status": "quota_waiting",
+        "quota_wait_reason": meta["quota_wait_reason"],
+        "quota_reset_at": meta.get("quota_reset_at"),
     }
+
+
+def mark_credential_suspended(
+    account_id: str,
+    *,
+    reason: str = "账号不可用",
+    source: str = "model_health",
+) -> dict[str, Any] | None:
+    """Permanent-ish credential/account block — NOT quota waiting."""
+    state = get_account_pool_state()
+    meta = state.get(account_id) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["enabled"] = False
+    meta["manual_disabled"] = False
+    meta["credential_suspended"] = True
+    meta["quota_waiting"] = False
+    meta["disabled_for_quota"] = False
+    meta["disabled_reason"] = (reason or "账号不可用")[:300]
+    meta["suspended_at"] = _now()
+    meta["suspend_source"] = source
+    meta["last_error"] = meta["disabled_reason"]
+    meta["quota_status"] = "credential_suspended"
+    state[account_id] = meta
+    save_account_pool_state(state)
+    print(f"  [pool] credential suspended: {account_id} — {meta['disabled_reason']}")
+    for a in list_pool_accounts():
+        if a["id"] == account_id:
+            return a
+    return {"id": account_id, "enabled": False, "credential_suspended": True}
+
+
+def disable_for_quota(
+    account_id: str,
+    *,
+    reason: str = "额度已耗尽",
+    source: str = "billing",
+    reset_at: float | None = None,
+    limit_tokens: int | float | None = None,
+    remaining_tokens: int | float | None = None,
+) -> dict[str, Any] | None:
+    """Backward-compatible entry: maps to mark_quota_waiting (never permanent)."""
+    return mark_quota_waiting(
+        account_id,
+        reason=reason,
+        source=source,
+        reset_at=reset_at,
+        limit_tokens=limit_tokens,
+        remaining_tokens=remaining_tokens,
+    )
+
+
+def clear_quota_waiting(
+    account_id: str,
+    *,
+    source: str = "quota_probe",
+) -> dict[str, Any] | None:
+    """Re-enter active pool after successful quota probe."""
+    state = get_account_pool_state()
+    meta = state.get(account_id) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["quota_waiting"] = False
+    meta["disabled_for_quota"] = False
+    # Only re-enable if not manually disabled for non-quota reasons
+    if meta.get("manual_disabled"):
+        meta["enabled"] = False
+    else:
+        meta["enabled"] = True
+    meta["quota_status"] = "active"
+    meta["quota_recovered_at"] = _now()
+    meta["quota_source"] = source
+    meta.pop("quota_wait_reason", None)
+    meta.pop("disabled_reason", None)
+    meta.pop("quota_reset_at", None)
+    meta.pop("quota_next_probe_at", None)
+    meta.pop("quota_waiting_since", None)
+    meta["last_error"] = ""
+    state[account_id] = meta
+    save_account_pool_state(state)
+    print(f"  [quota] account re-activated after quota recovery: {account_id}")
+    for a in list_pool_accounts():
+        if a["id"] == account_id:
+            return a
+    return {"id": account_id, "enabled": True, "quota_waiting": False, "quota_status": "active"}
 
 
 def save_quota_snapshot(account_id: str, quota_result: dict[str, Any]) -> None:
@@ -525,21 +699,34 @@ def try_acquire_sequence(
     mode = get_account_mode()
     all_live = list_live_credentials(include_expired=False, auto_refresh=True)
     state = get_account_pool_state()
-    enabled = [
-        c
-        for c in all_live
-        if _pool_meta(c.auth_key or "", state)["enabled"]
-        and not (model and is_model_blocked(c.auth_key or "", model, state))
-    ]
+    def _usable(c):
+        meta = _pool_meta(c.auth_key or "", state)
+        if is_quota_waiting(meta):
+            return False
+        if meta.get("disabled_for_quota") and not meta.get("quota_waiting"):
+            # legacy permanent flag: still exclude from request rotation
+            return False
+        if not meta.get("enabled", True) and not meta.get("quota_waiting"):
+            # manually disabled
+            if meta.get("enabled") is False and not meta.get("disabled_for_quota"):
+                return False
+        if model and is_model_blocked(c.auth_key or "", model, state):
+            return False
+        return bool(meta.get("enabled", True)) and not is_quota_waiting(meta)
+
+    enabled = [c for c in all_live if _usable(c)]
     if not enabled:
-        # fall back to all non-blocked enabled; if empty, all live (last resort)
+        # last resort: still never include quota_waiting accounts
         enabled = [
             c
             for c in all_live
-            if not (model and is_model_blocked(c.auth_key or "", model, state))
+            if not is_quota_waiting(_pool_meta(c.auth_key or "", state))
+            and not (model and is_model_blocked(c.auth_key or "", model, state))
+            and _pool_meta(c.auth_key or "", state).get("enabled", True)
         ]
     if not enabled:
-        enabled = list(all_live)
+        # Empty sequence is correct when every account is waiting/disabled.
+        return []
 
     # De-dupe by user_id (legacy dual keys)
     seen_users: set[str] = set()
@@ -608,3 +795,89 @@ def try_acquire_sequence(
 
 def load_for_id(account_id: str) -> GrokCredentials:
     return load_credentials_by_id(account_id)
+
+
+def list_quota_probe_due(*, now: float | None = None) -> list[str]:
+    """Account ids in quota_waiting whose reset/probe time has arrived."""
+    current = time.time() if now is None else now
+    state = get_account_pool_state()
+    due: list[str] = []
+    for aid, meta in state.items():
+        if not isinstance(meta, dict):
+            continue
+        if quota_probe_due(meta, now=current):
+            due.append(str(aid))
+    return due
+
+
+def process_quota_probe_due(
+    *,
+    now: float | None = None,
+    max_n: int = 20,
+    probe_fn=None,
+) -> dict[str, int]:
+    """Probe due waiting accounts; recover or schedule next grace probe.
+
+    probe_fn(account_id) -> dict with ok/exhausted/remaining_tokens keys.
+    Default uses quota.fetch_quota_for_creds when available.
+    """
+    current = time.time() if now is None else now
+    due = list_quota_probe_due(now=current)[: max(1, int(max_n))]
+    recovered = still_waiting = failed = 0
+    if not due:
+        return {"due": 0, "recovered": 0, "still_waiting": 0, "failed": 0}
+    for aid in due:
+        try:
+            if probe_fn is not None:
+                result = probe_fn(aid)
+            else:
+                from auth import load_credentials_by_id
+                from quota import probe_free_usage_for_creds
+
+                creds = load_credentials_by_id(aid)
+                if creds is None:
+                    failed += 1
+                    continue
+                # Production default: real 1M free-usage probe — NOT monthly /billing.
+                result = probe_free_usage_for_creds(creds)
+            state = get_account_pool_state()
+            meta = state.get(aid) or {}
+            if result.get("free_usage_ok") and not result.get("exhausted") and not result.get("inconclusive"):
+                if meta.get("quota_waiting") or meta.get("disabled_for_quota"):
+                    clear_quota_waiting(aid, source="quota_probe")
+                recovered += 1
+            elif result.get("exhausted") and not result.get("inconclusive"):
+                meta = dict(meta)
+                reset_at = float(meta.get("quota_reset_at") or 0)
+                post_reset = bool(reset_at and current >= reset_at)
+                if post_reset:
+                    meta["quota_confirmation_count"] = int(meta.get("quota_confirmation_count") or 0) + 1
+                    meta["quota_grace_count"] = int(meta.get("quota_grace_count") or 0) + 1
+                    meta["quota_last_confirm_at"] = current
+                    meta.setdefault("quota_first_confirm_at", current)
+                    meta["quota_status"] = "quota_grace"
+                    if meta["quota_confirmation_count"] >= 3 and meta["quota_grace_count"] >= 2:
+                        meta["quota_status"] = "quota_reset_failed"
+                else:
+                    # still inside original window — keep waiting, do not extend reset
+                    meta["quota_status"] = "quota_waiting"
+                meta["quota_next_probe_at"] = current + 1800.0
+                state[aid] = meta
+                save_account_pool_state(state)
+                still_waiting += 1
+            else:
+                # inconclusive network/429/5xx — retry later, no grace/terminal evidence
+                meta = dict(meta)
+                meta["quota_next_probe_at"] = current + 900.0
+                meta["quota_status"] = "quota_probe_due"
+                state[aid] = meta
+                save_account_pool_state(state)
+                still_waiting += 1
+        except Exception:
+            failed += 1
+    return {
+        "due": len(due),
+        "recovered": recovered,
+        "still_waiting": still_waiting,
+        "failed": failed,
+    }

@@ -129,9 +129,14 @@ def handle_upstream_error_for_model(
 
     if is_account_block_error(error, status_code):
         reason = f"账号不可用 (HTTP {status_code}): {(error or '')[:120]}"
-        return account_pool.disable_for_quota(
-            account_id, reason=reason, source="model_health"
-        )
+        # Permanent credential/account block — NOT free-usage waiting.
+        if hasattr(account_pool, "mark_credential_suspended"):
+            return account_pool.mark_credential_suspended(
+                account_id, reason=reason, source="model_health"
+            )
+        return account_pool.disable_account(
+            account_id, enabled=False
+        ) if hasattr(account_pool, "disable_account") else None
 
     if model and is_model_unavailable_error(error, status_code):
         reason = f"模型不可用 (HTTP {status_code}): {(error or '')[:160]}"
@@ -192,6 +197,7 @@ def probe_model_for_creds(
     auto_disable: bool | None = None,
     source: str = "manual",
     report_stats: bool = True,
+    proxy: str | None = None,
 ) -> dict[str, Any]:
     """
     Lightweight chat probe to verify the account can use `model`.
@@ -223,7 +229,10 @@ def probe_model_for_creds(
         "max_completion_tokens": 8,
     }
     try:
-        with httpx.Client(timeout=_PROBE_TIMEOUT) as client:
+        client_kwargs: dict = {"timeout": _PROBE_TIMEOUT, "trust_env": False}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+        with httpx.Client(**client_kwargs) as client:
             with client.stream("POST", url, headers=headers, json=body) as resp:
                 status = resp.status_code
                 if status >= 400:
@@ -366,14 +375,34 @@ def probe_single_account(
 
 
 def _unique_live_creds(*, auto_refresh: bool = False) -> list[GrokCredentials]:
-    """De-dupe live credentials. Default auto_refresh=False avoids startup storms."""
+    """De-dupe live credentials. Default auto_refresh=False avoids startup storms.
+
+    Excludes quota_waiting / reset_failed / manual_disabled / credential_suspended
+    so model health never burns free-usage waiting accounts.
+    """
     all_c = list_live_credentials(include_expired=False, auto_refresh=auto_refresh)
+    try:
+        import account_pool as ap
+        state = ap.get_account_pool_state()
+    except Exception:
+        ap = None
+        state = {}
     seen: set[str] = set()
     out: list[GrokCredentials] = []
     for c in all_c:
         uid = c.user_id or c.auth_key or ""
         if uid in seen:
             continue
+        if ap is not None:
+            meta = ap._pool_meta(c.auth_key or "", state)
+            if ap.is_quota_waiting(meta):
+                continue
+            if meta.get("credential_suspended") or meta.get("manual_disabled"):
+                continue
+            if meta.get("quota_status") == "quota_reset_failed":
+                continue
+            if meta.get("enabled") is False:
+                continue
         seen.add(uid)
         out.append(c)
     return out

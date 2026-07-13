@@ -889,7 +889,8 @@ class XConsoleAuthClient:
                     print(f"  [sso] attempt {attempt}/{attempts} failed, retrying...")
                 _time.sleep(0.8 * attempt)
 
-        if token and (save or email):
+        if token and save:
+            # Explicit save only — never persist on email alone (production must pass save=False)
             save_sso(token, email=email, password=password, output_dir=output_dir)
         return token
 

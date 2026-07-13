@@ -1,0 +1,10 @@
+.git
+**/__pycache__
+**/*.pyc
+examples
+tests
+images
+screenshots
+.github
+*.md
+\!README.md
