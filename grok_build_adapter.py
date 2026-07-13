@@ -2,7 +2,7 @@
 
 Drives the vendored ``grok-build-auth/xconsole_client`` protocol client to:
 
-1. register an x.ai account with MoeMail + YesCaptcha
+1. register an x.ai account with a configured mail provider + YesCaptcha
 2. extract SSO/session cookies
 3. convert SSO via sso_to_auth_json into a local auth.json entry
 4. import that entry into the multi-account pool
@@ -30,7 +30,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-11-protocol-5"
+ADAPTER_BUILD = "2026-07-13-yyds-mail-1"
 
 YESCAPTCHA_KEY = (
     os.environ.get("GROK2API_YESCAPTCHA_KEY")
@@ -238,14 +238,28 @@ def ensure_xconsole() -> None:
 
 def registration_available() -> dict[str, Any]:
     """Non-raising health probe for admin UI / startup logs."""
-    moemail_configured = bool(
-        os.environ.get("GROK2API_MOEMAIL_API_KEY")
-        or os.environ.get("MOEMAIL_API_KEY")
-    )
+    mail_provider = "moemail"
+    mail_configured = False
+    moemail_configured = False
+    yydsmail_configured = False
     try:
-        from config import MOEMAIL_API_KEY as _cfg_moemail
+        from config import (
+            MAIL_PROVIDER,
+            MOEMAIL_API_KEY,
+            YYDSMAIL_API_KEY,
+            YYDSMAIL_BASE_URL,
+        )
 
-        moemail_configured = moemail_configured or bool(_cfg_moemail)
+        mail_provider = _normalize_mail_provider(MAIL_PROVIDER)
+        moemail_configured = bool(
+            os.environ.get("GROK2API_MOEMAIL_API_KEY")
+            or os.environ.get("MOEMAIL_API_KEY")
+            or MOEMAIL_API_KEY
+        )
+        yydsmail_configured = bool(YYDSMAIL_API_KEY and YYDSMAIL_BASE_URL)
+        mail_configured = (
+            yydsmail_configured if mail_provider == "yyds" else moemail_configured
+        )
     except Exception:
         pass
     try:
@@ -258,7 +272,10 @@ def registration_available() -> dict[str, Any]:
             "vendored": True,
             "adapter_build": ADAPTER_BUILD,
             "yescaptcha_configured": bool(YESCAPTCHA_KEY),
+            "mail_provider": mail_provider,
+            "mail_configured": mail_configured,
             "moemail_configured": moemail_configured,
+            "yydsmail_configured": yydsmail_configured,
         }
     except Exception as e:  # noqa: BLE001
         return {
@@ -270,13 +287,25 @@ def registration_available() -> dict[str, Any]:
             "adapter_build": ADAPTER_BUILD,
             "error": str(e),
             "yescaptcha_configured": bool(YESCAPTCHA_KEY),
+            "mail_provider": mail_provider,
+            "mail_configured": mail_configured,
             "moemail_configured": moemail_configured,
+            "yydsmail_configured": yydsmail_configured,
         }
 
 
 # --------------------------------------------------------------------------- #
-# mail provider: moemail (reuse grokcli-2api config)
+# mail provider: MoeMail / YYDS Mail
 # --------------------------------------------------------------------------- #
+def _normalize_mail_provider(provider: str | None) -> str:
+    raw = (provider or "moemail").strip().lower()
+    if raw == "yydsmail":
+        raw = "yyds"
+    if raw not in {"moemail", "yyds"}:
+        raise ValueError("mail provider must be moemail or yyds")
+    return raw
+
+
 def _make_email_receiver(
     *,
     api_key: str | None = None,
@@ -284,9 +313,31 @@ def _make_email_receiver(
     prefix: str | None = None,
     domain: str | None = None,
     expiry_ms: int | None = None,
+    mail_provider: str | None = None,
 ):
+    from config import (
+        MAIL_PROVIDER,
+        MOEMAIL_API_KEY,
+        MOEMAIL_BASE_URL,
+        MOEMAIL_DOMAIN,
+        MOEMAIL_EXPIRY_MS,
+        YYDSMAIL_API_KEY,
+        YYDSMAIL_BASE_URL,
+        YYDSMAIL_DOMAIN,
+    )
+
+    provider = _normalize_mail_provider(mail_provider or MAIL_PROVIDER)
+    if provider == "yyds":
+        from yydsmail import create_yydsmail_receiver
+
+        return create_yydsmail_receiver(
+            prefix=prefix,
+            api_key=api_key or YYDSMAIL_API_KEY,
+            base_url=base_url or YYDSMAIL_BASE_URL,
+            domain=domain if domain is not None else YYDSMAIL_DOMAIN,
+        )
+
     from moemail import moemail_create_mailbox
-    from config import MOEMAIL_API_KEY, MOEMAIL_BASE_URL, MOEMAIL_DOMAIN, MOEMAIL_EXPIRY_MS
 
     key = (api_key or MOEMAIL_API_KEY or "").strip()
     if not key:
@@ -308,6 +359,8 @@ def _make_email_receiver(
     address = mailbox["email"]
 
     class _MoeMailReceiver:
+        provider = "moemail"
+
         def __init__(self, email: str, email_id: str, api_key: str | None, base_url: str | None):
             self.email = email
             self.email_id = email_id
@@ -381,6 +434,7 @@ def _start_one_registration(
     *,
     yescaptcha_key: str,
     proxy: str,
+    mail_provider: str | None = None,
     moemail_api_key: str | None = None,
     moemail_base_url: str | None = None,
     prefix: str | None = None,
@@ -398,6 +452,7 @@ def _start_one_registration(
 
     try:
         email, receiver = _make_email_receiver(
+            mail_provider=mail_provider,
             api_key=moemail_api_key,
             base_url=moemail_base_url,
             prefix=prefix,
@@ -429,6 +484,7 @@ def _start_one_registration(
         "created_at": _now(),
         "updated_at": _now(),
         "email": email,
+        "mail_provider": str(getattr(receiver, "provider", mail_provider or "moemail")),
         "password": password,
         "message": f"started; email={email}",
         "sso": None,
@@ -466,6 +522,7 @@ def start_registration(
     *,
     yescaptcha_key: str | None = None,
     proxy: str | None = None,
+    mail_provider: str | None = None,
     moemail_api_key: str | None = None,
     moemail_base_url: str | None = None,
     prefix: str | None = None,
@@ -485,6 +542,13 @@ def start_registration(
         return {"ok": False, "error": str(e)}
 
     _clean_old_sessions()
+
+    try:
+        from config import MAIL_PROVIDER
+
+        provider = _normalize_mail_provider(mail_provider or MAIL_PROVIDER)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
 
     key = (yescaptcha_key or YESCAPTCHA_KEY or "").strip()
     if not key:
@@ -522,6 +586,7 @@ def start_registration(
         return _start_one_registration(
             yescaptcha_key=key,
             proxy=proxy_val,
+            mail_provider=provider,
             moemail_api_key=moemail_api_key,
             moemail_base_url=moemail_base_url,
             prefix=prefix,
@@ -538,6 +603,7 @@ def start_registration(
         "count": n,
         "concurrency": workers,
         "stagger_ms": stagger,
+        "mail_provider": provider,
         "session_ids": [],
         "adapter_build": ADAPTER_BUILD,
         "message": f"batch started count={n} concurrency={workers}",
@@ -554,12 +620,22 @@ def start_registration(
 
         def _job(i: int) -> dict[str, Any]:
             delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
+            job_prefix = prefix
+            if prefix and n > 1:
+                suffix = f"-{i}"
+                available = 64 - len(suffix)
+                job_prefix = (
+                    f"{prefix[:available]}{suffix}"
+                    if available > 0
+                    else secrets.token_hex(10)
+                )
             return _start_one_registration(
                 yescaptcha_key=key,
                 proxy=proxy_val,
+                mail_provider=provider,
                 moemail_api_key=moemail_api_key,
                 moemail_base_url=moemail_base_url,
-                prefix=prefix,
+                prefix=job_prefix,
                 domain=domain,
                 expiry_ms=expiry_ms,
                 batch_id=batch_id,
@@ -765,7 +841,7 @@ def _run_registration(
                 f"invalid email verification code shape: {code!r} "
                 f"(expect 6 alnum chars)"
             )
-        update("registering", f"code received: {code}; verifying + creating immediately")
+        update("registering", "verification code received; verifying + creating immediately")
 
         # Prefer empty castle token (YesCaptcha cannot mint Castle fingerprints).
         # Retry create_account once with a fresh Turnstile + fresh email code when
@@ -808,7 +884,7 @@ def _run_registration(
                     )
                     if len(code) != 6:
                         raise RuntimeError(f"fresh email code invalid: {code!r}")
-                    update("registering", f"fresh code received: {code}")
+                    update("registering", "fresh verification code received")
                 except Exception as mail_err:  # noqa: BLE001
                     print(f"[grok-build-auth] email code refresh failed: {mail_err}")
                     break
@@ -1204,6 +1280,12 @@ def _run_registration(
     except Exception as exc:  # noqa: BLE001
         update("error", f"failed: {exc}", error=str(exc))
     finally:
+        close_receiver = getattr(receiver, "close", None)
+        if callable(close_receiver):
+            try:
+                close_receiver()
+            except Exception:
+                pass
         if client is not None:
             try:
                 client.close()

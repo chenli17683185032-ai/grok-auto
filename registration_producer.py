@@ -24,6 +24,13 @@ from secure_storage import atomic_write_private_json
 
 BASE_URL = os.getenv("GROK2API_PRODUCER_BASE_URL", "http://grokcli-2api:3000").rstrip("/")
 PASSWORD = os.getenv("GROK2API_ADMIN_PASSWORD", "")
+_MAIL_PROVIDER_RAW = os.getenv("GROK2API_MAIL_PROVIDER", "moemail").strip().lower()
+MAIL_PROVIDER = "yyds" if _MAIL_PROVIDER_RAW == "yydsmail" else _MAIL_PROVIDER_RAW
+if MAIL_PROVIDER not in {"moemail", "yyds"}:
+    raise ValueError("GROK2API_MAIL_PROVIDER must be moemail or yyds")
+YYDSMAIL_DOMAIN = (
+    os.getenv("GROK2API_YYDSMAIL_DOMAIN", "").strip().lower().lstrip("@").strip(".")
+)
 BATCH_SIZE = max(1, int(os.getenv("GROK2API_PRODUCER_BATCH_SIZE", "1")))
 CONCURRENCY = max(1, int(os.getenv("GROK2API_PRODUCER_CONCURRENCY", "1")))
 STAGGER_MS = max(0, int(os.getenv("GROK2API_PRODUCER_STAGGER_MS", "1500")))
@@ -412,6 +419,10 @@ def _save_producer_state(state: dict[str, Any]) -> None:
 
 
 def _registration_domain() -> str | None:
+    if MAIL_PROVIDER == "yyds":
+        # Empty means YYDS chooses a healthy domain server-side. Never inherit
+        # MoeMail's domain list when the active provider is YYDS.
+        return YYDSMAIL_DOMAIN or None
     if not PRODUCER_DOMAINS:
         return None
     imported_lifetime = max(0, _safe_int(_producer_state().get("imported_lifetime")))
@@ -781,15 +792,18 @@ def run_forever() -> None:
             requested_count = min(BATCH_SIZE, gap, max(1, remaining_q))
             run_concurrency = min(adaptive_concurrency, requested_count)
             domain = _registration_domain()
-            if domain:
-                print(f"[registration-producer] mailbox_domain={domain}", flush=True)
+            print(
+                f"[registration-producer] mail_provider={MAIL_PROVIDER} "
+                f"mailbox_domain={domain or 'auto'}",
+                flush=True,
+            )
             _set_registration_active(True)
             started = _request(
                 "POST",
                 "/admin/api/accounts/register-email",
                 token=token,
                 body={
-                    "provider": "moemail",
+                    "provider": MAIL_PROVIDER,
                     "protocol": "grpc",
                     "count": requested_count,
                     "concurrency": run_concurrency,

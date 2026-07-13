@@ -118,13 +118,17 @@ class ImportSsoBody(BaseModel):
 class EmailRegistrationBody(BaseModel):
     """Start email-assisted accounts.x.ai registration."""
 
-    provider: str = Field(default="moemail", pattern="^moemail$")
+    provider: str | None = Field(
+        default=None,
+        pattern="^(moemail|yyds|yydsmail)$",
+        description="Temporary mail provider; omitted means use GROK2API_MAIL_PROVIDER",
+    )
     protocol: str = Field(default="grpc", pattern="^grpc$")
     email: str | None = Field(default=None, max_length=256)
     mailbox_id: str | None = Field(default=None, max_length=256)
     prefix: str | None = Field(default=None, max_length=64)
     domain: str | None = Field(default=None, max_length=128)
-    # MoeMail official presets only: 1h / 24h / 3d / permanent(0)
+    # MoeMail supports these expiry values; YYDS mailboxes are fixed at about 24h.
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
     api_key: str | None = Field(default=None, max_length=512)
     yescaptcha_key: str | None = Field(default=None, max_length=512)
@@ -690,40 +694,56 @@ def _require_register_adapter():
     return reg_adapter
 
 
+def _is_legacy_register_signature_error(exc: TypeError) -> bool:
+    message = str(exc)
+    return "unexpected keyword argument" in message and any(
+        name in message
+        for name in ("mail_provider", "count", "concurrency", "stagger_ms")
+    )
+
+
 @router.post("/accounts/register-email")
 async def start_email_registration(
     body: EmailRegistrationBody,
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Start protocol registration (grok-build-auth) + MoeMail + SSO import.
+    """Start protocol registration with the configured mail provider and SSO import.
 
     Supports multi-thread batch via count/concurrency/stagger_ms.
     """
     require_admin(request, x_admin_token)
     adapter = _require_register_adapter()
+    provider_override = body.provider is not None
+    mail_api_key = body.api_key if provider_override else None
+    mail_base_url = body.base_url if provider_override else None
+    mail_domain = body.domain if provider_override else None
+    mail_expiry_ms = body.expiry_ms if provider_override else None
     try:
         result = adapter.start_registration(
             proxy=body.proxy,
-            moemail_api_key=body.api_key,
-            moemail_base_url=body.base_url,
+            moemail_api_key=mail_api_key,
+            moemail_base_url=mail_base_url,
+            mail_provider=body.provider,
             prefix=body.prefix,
-            domain=body.domain,
-            expiry_ms=body.expiry_ms,
+            domain=mail_domain,
+            expiry_ms=mail_expiry_ms,
             yescaptcha_key=body.yescaptcha_key,
             count=body.count,
             concurrency=body.concurrency,
             stagger_ms=body.stagger_ms,
         )
-    except TypeError:
+    except TypeError as e:
+        if not _is_legacy_register_signature_error(e):
+            raise HTTPException(status_code=400, detail=str(e)) from e
         # Older adapter without batch kwargs.
         try:
             result = adapter.start_registration(
                 proxy=body.proxy,
-                moemail_api_key=body.api_key,
-                moemail_base_url=body.base_url,
+                moemail_api_key=mail_api_key,
+                moemail_base_url=mail_base_url,
                 prefix=body.prefix,
-                domain=body.domain,
+                domain=mail_domain,
                 yescaptcha_key=body.yescaptcha_key,
             )
         except Exception as e:  # noqa: BLE001

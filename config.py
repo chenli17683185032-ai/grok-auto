@@ -169,6 +169,15 @@ MOEMAIL_BASE_URL = os.getenv("GROK2API_MOEMAIL_BASE_URL", "https://moemail.52188
 MOEMAIL_API_KEY = os.getenv("GROK2API_MOEMAIL_API_KEY", "")
 MOEMAIL_DOMAIN = os.getenv("GROK2API_MOEMAIL_DOMAIN", "lolicc.online")
 MOEMAIL_EXPIRY_MS = int(os.getenv("GROK2API_MOEMAIL_EXPIRY_MS", "3600000"))
+_MAIL_PROVIDER_RAW = os.getenv("GROK2API_MAIL_PROVIDER", "moemail").strip().lower()
+MAIL_PROVIDER = "yyds" if _MAIL_PROVIDER_RAW == "yydsmail" else _MAIL_PROVIDER_RAW
+if MAIL_PROVIDER not in {"moemail", "yyds"}:
+    raise ValueError("GROK2API_MAIL_PROVIDER must be moemail or yyds")
+YYDSMAIL_API_KEY = os.getenv("GROK2API_YYDSMAIL_API_KEY", "")
+YYDSMAIL_BASE_URL = os.getenv(
+    "GROK2API_YYDSMAIL_BASE_URL", "https://maliapi.215.im/v1"
+).rstrip("/")
+YYDSMAIL_DOMAIN = os.getenv("GROK2API_YYDSMAIL_DOMAIN", "").strip().lstrip("@").strip(".")
 # Auto-refresh access tokens this many seconds before expiry
 TOKEN_REFRESH_SKEW = float(os.getenv("GROK2API_TOKEN_REFRESH_SKEW", "120"))
 

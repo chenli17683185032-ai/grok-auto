@@ -297,6 +297,19 @@ class RegistrationProducerTests(unittest.TestCase):
             producer._record_imported(1)
             self.assertEqual(producer._registration_domain(), "b.example")
 
+    def test_yyds_domain_never_falls_back_to_moemail_rotation(self) -> None:
+        with patch.object(producer, "MAIL_PROVIDER", "yyds"), patch.object(
+            producer, "YYDSMAIL_DOMAIN", ""
+        ), patch.object(
+            producer, "PRODUCER_DOMAINS", ("legacy-moemail.example",)
+        ):
+            self.assertIsNone(producer._registration_domain())
+
+        with patch.object(producer, "MAIL_PROVIDER", "yyds"), patch.object(
+            producer, "YYDSMAIL_DOMAIN", "fixed-yyds.example"
+        ):
+            self.assertEqual(producer._registration_domain(), "fixed-yyds.example")
+
     def test_corrupt_persisted_counts_fail_safe(self) -> None:
         with tempfile.TemporaryDirectory() as td, patch.object(
             producer, "PRODUCER_STATE", Path(td) / "state.json"

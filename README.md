@@ -66,7 +66,7 @@
 | Token 自动续期 | 后台维护线程自适应刷新 |
 | 模型探测 | 单账号 / 全量探测；异常自动屏蔽 |
 | **授权方式** | 设备码登录 · 导入 auth.json / JWT / SSO · **协议注册** |
-| **协议注册** | MoeMail 临时邮箱 + YesCaptcha Turnstile + 自动导入账号池 |
+| **协议注册** | MoeMail / YYDS Mail 临时邮箱 + YesCaptcha Turnstile + 自动导入账号池 |
 | **多线程注册** | `count` / `concurrency` / `stagger_ms` 批量并发 |
 | **账号运维** | 搜索 · 多选 · 批量删除 |
 | 中继兼容 | new-api 测速 / 操练场流式；自动剥离不支持采样参数 |
@@ -80,7 +80,7 @@
    - `cli-chat-proxy.grok.com`（对话上游）
    - `auth.x.ai` / `accounts.x.ai`（设备码、刷新、协议注册）
 3. 若使用协议注册：
-   - **MoeMail** API Key（临时邮箱）
+   - **MoeMail** 或 **YYDS Mail** API Key（临时邮箱）
    - **YesCaptcha** API Key（Turnstile）
 
 ---
@@ -102,7 +102,7 @@ pip install -r requirements.txt
 ```bash
 cd /opt/grokcli-2api   # 或你的部署目录
 cp .env.example .env
-# 编辑 .env：管理密码、MoeMail / YesCaptcha 等
+# 编辑 .env：管理密码、临时邮箱 Provider / YesCaptcha 等
 # 默认 GROK2API_REASONING_COMPAT=off（sub2api / Claude Code 推荐）
 
 python3 -m pip install -r requirements.txt
@@ -154,11 +154,11 @@ docker compose up -d --build
 - JWT 访问令牌
 - **SSO Cookie** 批量导入（Device Flow 自动换 token）
 
-### 方式 C：协议注册（MoeMail + YesCaptcha）
+### 方式 C：协议注册（临时邮箱 + YesCaptcha）
 
 基于内置 `grok-build-auth` HTTP 协议，**无需浏览器**：
 
-1. 配置 MoeMail + YesCaptcha（环境变量或管理台表单）
+1. 在 `.env` 配置 MoeMail 或 YYDS Mail，并配置 YesCaptcha
 2. 管理台 → 协议注册
 3. 设置：
    - **注册数量**（批量）
@@ -166,7 +166,7 @@ docker compose up -d --build
    - **启动间隔 ms**（错峰，减限流）
 4. 启动后自动：建号 → 提取 SSO → 转 token → 导入账号池
 
-> 注册成功与否依赖邮箱域名信誉、Turnstile 打码质量与 xAI 风控。若出现 `wke=email:invalid-validation-code`，多为验证码时效问题（当前版本已改为“先打码再收码”）。
+> 注册成功与否依赖邮箱域名信誉、Turnstile 打码质量与 xAI 风控。若出现 `wke=email:invalid-validation-code`，多为验证码时效问题（当前版本已改为“先打码再收码”）。YYDS 邮箱约保留 24 小时；收件接口使用长轮询，等待连接持续到新邮件到达或服务端超时属于正常行为。
 
 #### 注册 API 示例
 
@@ -175,14 +175,14 @@ curl -X POST http://127.0.0.1:3000/admin/api/accounts/register-email \
   -H "X-Admin-Token: <admin-token>" \
   -H "Content-Type: application/json" \
   -d '{
+    "provider": "yyds",
     "count": 5,
     "concurrency": 2,
-    "stagger_ms": 500,
-    "yescaptcha_key": "YOUR_YESCAPTCHA_KEY",
-    "api_key": "YOUR_MOEMAIL_KEY",
-    "domain": "lolicc.online"
+    "stagger_ms": 500
   }'
 ```
+
+生产环境不要在请求体、命令历史或日志中传递邮箱及 YesCaptcha 密钥；将它们只保存在权限为 `0600` 的 `.env`。YYDS 域名留空时由服务端自动选择健康域名。
 
 查询：
 
@@ -386,10 +386,14 @@ cp .env.example .env
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
+| `GROK2API_MAIL_PROVIDER` | `moemail` | 临时邮箱 Provider：`moemail` 或 `yyds`；默认值保持旧部署兼容 |
 | `GROK2API_MOEMAIL_API_KEY` | 空 | MoeMail API Key |
 | `GROK2API_MOEMAIL_BASE_URL` | `https://moemail.521884.xyz` | MoeMail 服务地址 |
 | `GROK2API_MOEMAIL_DOMAIN` | `lolicc.online` | 临时邮箱域名 |
 | `GROK2API_MOEMAIL_EXPIRY_MS` | `3600000` | 邮箱有效期 |
+| `GROK2API_YYDSMAIL_API_KEY` | 空 | YYDS Mail API Key，仅保存在 `.env` |
+| `GROK2API_YYDSMAIL_BASE_URL` | `https://maliapi.215.im/v1` | YYDS Mail API 基址；[文档入口](https://vip.215.im/docs) 不是 API 基址 |
+| `GROK2API_YYDSMAIL_DOMAIN` | 空 | 可选固定域名；留空时服务端自动选择健康域名 |
 | `GROK2API_YESCAPTCHA_KEY` / `YESCAPTCHA_API_KEY` | 空 | YesCaptcha Key |
 | `GROK2API_YESCAPTCHA_ENDPOINT` | 官方默认 | 打码接口 |
 | `GROK2API_YESCAPTCHA_TIMEOUT` | `180` | 打码超时（秒） |
@@ -451,9 +455,11 @@ cp .env.example .env
 
 邮箱验证码失效/单次使用冲突。当前流程已改为 **先 Turnstile、后收码并立即建号**。若仍失败：
 
-- 换 MoeMail 域名
+- 更换当前临时邮箱 Provider 的域名；YYDS 可留空并自动选择
 - 降低并发
 - 检查代理与打码成功率
+
+YYDS 收件使用长轮询。反向代理和客户端读取超时应覆盖完整验证码等待窗口；一次长轮询超时或暂时返回空列表不代表邮箱失效，客户端会继续轮询。
 
 ### 多账号不轮询
 
@@ -481,7 +487,7 @@ grokcli-2api/
   app.py                 # 主服务 + 流式兼容 + failover
   admin_routes.py        # 管理 API
   grok_build_adapter.py  # 协议注册适配（多线程批量）
-  moemail.py             # MoeMail / 代理工具
+  moemail.py / yydsmail.py  # 临时邮箱 Provider / 代理工具
   grok-build-auth/       # 内置协议注册引擎（vendored）
   auth.py / auth_store.py
   accounts.py            # 设备码 / 导入 / 删除

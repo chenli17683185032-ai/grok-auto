@@ -48,12 +48,29 @@ env_mode="$(stat -c '%a' "$ENV_FILE")"
 
 for required in \
   GROK2API_ADMIN_PASSWORD \
-  GROK2API_MOEMAIL_API_KEY \
-  GROK2API_MOEMAIL_BASE_URL \
-  GROK2API_MOEMAIL_DOMAIN \
   GROK2API_YESCAPTCHA_KEY; do
   require_env_name "$required"
 done
+
+mail_provider="$(env_value GROK2API_MAIL_PROVIDER)"
+mail_provider="${mail_provider:-moemail}"
+mail_provider="$(printf '%s' "$mail_provider" | sed "s/^[\"']//; s/[\"']$//" | tr '[:upper:]' '[:lower:]')"
+case "$mail_provider" in
+  moemail)
+    require_env_name GROK2API_MOEMAIL_API_KEY
+    require_env_name GROK2API_MOEMAIL_BASE_URL
+    require_env_name GROK2API_MOEMAIL_DOMAIN
+    ;;
+  yyds|yydsmail)
+    require_env_name GROK2API_YYDSMAIL_API_KEY
+    require_env_name GROK2API_YYDSMAIL_BASE_URL
+    # GROK2API_YYDSMAIL_DOMAIN is optional; empty lets YYDS choose a domain.
+    ;;
+  *)
+    fail "GROK2API_MAIL_PROVIDER must be moemail or yyds"
+    ;;
+esac
+printf 'preflight: mail provider %s selected\n' "$mail_provider"
 
 if [[ "${GROK2API_PREFLIGHT_PIPELINE_V2:-1}" == "1" ]]; then
   [[ "$(env_value GROK2API_PIPELINE_V2)" == "1" ]] || fail "GROK2API_PIPELINE_V2 must be 1"

@@ -41,9 +41,11 @@ chmod 600 .env
 
 ```env
 GROK2API_ADMIN_PASSWORD=<secret>
-GROK2API_MOEMAIL_API_KEY=<secret>
-GROK2API_MOEMAIL_BASE_URL=https://mail.example.invalid
-GROK2API_MOEMAIL_DOMAIN=mail.example.invalid
+GROK2API_MAIL_PROVIDER=yyds
+GROK2API_YYDSMAIL_API_KEY=<secret>
+GROK2API_YYDSMAIL_BASE_URL=https://maliapi.215.im/v1
+# 可选；留空时服务端自动选择健康域名
+GROK2API_YYDSMAIL_DOMAIN=
 GROK2API_YESCAPTCHA_KEY=<secret>
 GROK2API_REQUIRE_API_KEY=1
 
@@ -58,6 +60,10 @@ GROK2API_MIHOMO_CONFIG_DIR=/opt/new-api/mihomo
 GROK2API_MIHOMO2_CONFIG_DIR=/opt/grokcli-2api/mihomo-2
 GROK2API_NEW_API_NETWORK=app_yunbay-network
 ```
+
+邮箱及 YesCaptcha 密钥只能保存在权限为 `0600` 的 `.env`，不要写入 Compose、请求体、命令历史、日志、提交或运维记录。`https://vip.215.im/docs` 是 YYDS 文档入口，实际 API 基址是 `https://maliapi.215.im/v1`。YYDS 邮箱约保留 24 小时，收件请求使用长轮询；服务端或反向代理的读取超时必须覆盖验证码等待窗口，单次长轮询超时不代表邮箱失效。
+
+旧 MoeMail 部署继续受支持：设置 `GROK2API_MAIL_PROVIDER=moemail`，并配置 `GROK2API_MOEMAIL_API_KEY`、`GROK2API_MOEMAIL_BASE_URL`、`GROK2API_MOEMAIL_DOMAIN`。Preflight 会按选中的 Provider 检查对应配置；YYDS 域名不是必填项。
 
 禁止使用 `latest`。回滚依赖版本化镜像 Tag；更严格的环境可将三项镜像配置为 Digest。
 
