@@ -16,3 +16,16 @@ vendors
 **/oauth_output
 **/accounts_output
 **/cliproxyapi_auth
+
+# Runtime serves the prebuilt static/admin + static/dist assets.  Exclude the
+# duplicate frontend sources and release-only material from production images.
+static/js
+static/css
+scripts/build_admin_assets.py
+.github
+docs
+dev.sh
+docker-rebuild.sh
+start.bat
+start.ps1
+start.sh

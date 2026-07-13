@@ -61,6 +61,17 @@ LOCAL_SOLVER_URL = (
 MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "10") or 10)
 DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)
 
+
+def _email_code_timeout_sec() -> float:
+    """Keep a slow mailbox from occupying a registration worker."""
+    try:
+        value = float(
+            os.environ.get("GROK2API_REG_EMAIL_CODE_TIMEOUT_SEC", "15") or 15
+        )
+    except (TypeError, ValueError):
+        value = 15.0
+    return min(120.0, max(1.0, value))
+
 # --------------------------------------------------------------------------- #
 # session state
 # --------------------------------------------------------------------------- #
@@ -1770,15 +1781,16 @@ def _run_registration(
             return False
 
         try:
+            email_timeout = _email_code_timeout_sec()
             code = receiver.wait_for_code(
-                timeout=120.0,
+                timeout=email_timeout,
                 should_cancel=_mail_should_cancel,
                 poll_interval=1.0,
             )
         except TypeError:
             # Older receiver signature fallback.
             code = None
-            mail_deadline = time.time() + 120.0
+            mail_deadline = time.time() + _email_code_timeout_sec()
             while time.time() < mail_deadline:
                 _check_cancel()
                 try:
@@ -1830,7 +1842,9 @@ def _run_registration(
                 try:
                     client.create_email_validation_code(email)
                     update("waiting_email", "waiting for fresh xAI verification code")
-                    code = receiver.wait_for_code(timeout=120)
+                    code = receiver.wait_for_code(
+                        timeout=_email_code_timeout_sec()
+                    )
                     code = (
                         str(code or "")
                         .strip()

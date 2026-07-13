@@ -1,0 +1,121 @@
+name: grokcli-upstream
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    mem_limit: 128m
+    networks:
+      default:
+        aliases:
+          - grokcli-upstream-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: grok2api
+      POSTGRES_PASSWORD: "${GROK2API_POSTGRES_PASSWORD:?set GROK2API_POSTGRES_PASSWORD}"
+      POSTGRES_DB: grok2api
+    volumes:
+      - grokcli_upstream_pg:/var/lib/postgresql/data
+    mem_limit: 512m
+    networks:
+      default:
+        aliases:
+          - grokcli-upstream-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grok2api -d grok2api"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  grokcli-2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: "${GROK2API_APP_IMAGE:-grokcli-2api:20260713-upstream-v1947}"
+    restart: unless-stopped
+    logging: *logging
+    env_file:
+      - path: "${GROK2API_ENV_FILE:-.env}"
+        required: true
+    environment:
+      GROK2API_HOST: 0.0.0.0
+      GROK2API_PORT: "3000"
+      GROK2API_OPEN_BROWSER: "0"
+      GROK2API_STORE_BACKEND: hybrid
+      GROK2API_REQUIRE_SHARED_STORES: "1"
+      GROK2API_WORKERS: "${GROK2API_WORKERS:-2}"
+      GROK2API_TOKEN_MAINTAIN: "1"
+      GROK2API_MODEL_HEALTH: "1"
+      GROK2API_REQUIRE_API_KEY: "1"
+      REDIS_URL: redis://grokcli-upstream-redis:6379/0
+      GROK2API_REDIS_URL: redis://grokcli-upstream-redis:6379/0
+      DATABASE_URL: "postgresql://grok2api:${GROK2API_POSTGRES_PASSWORD}@grokcli-upstream-postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:${GROK2API_POSTGRES_PASSWORD}@grokcli-upstream-postgres:5432/grok2api"
+      GROK2API_CAPTCHA_PROVIDER: local
+      CAPTCHA_PROVIDER: local
+      GROK2API_INLINE_SOLVER: "1"
+      GROK2API_LOCAL_SOLVER_URL: http://127.0.0.1:5072
+      LOCAL_SOLVER_URL: http://127.0.0.1:5072
+      TURNSTILE_HOST: 127.0.0.1
+      TURNSTILE_PORT: "5072"
+      TURNSTILE_BROWSER_TYPE: camoufox
+      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-2}"
+      TURNSTILE_LAZY: "1"
+      TURNSTILE_IDLE_SEC: "180"
+      GROK2API_REG_CONCURRENCY: "${GROK2API_REG_CONCURRENCY:-2}"
+      GROK2API_REG_EMAIL_CODE_TIMEOUT_SEC: "15"
+      GROK2API_REG_PROBE_DELAY_SEC: "600"
+      GROK2API_MAIL_PROVIDER: yyds
+    ports:
+      - "127.0.0.1:${GROK2API_BIND_PORT:-3301}:3000"
+    shm_size: 1gb
+    mem_limit: 4g
+    cpus: "2.50"
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./data:/app/data
+      - ./turnstile-solver/logs:/app/turnstile-solver/logs
+    networks:
+      default:
+      new-api:
+        aliases:
+          - grokcli-2api
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+volumes:
+  grokcli_upstream_pg:
+
+networks:
+  default:
+    driver: bridge
+  new-api:
+    external: true
+    name: "${GROK2API_NEW_API_NETWORK:-app_yunbay-network}"
