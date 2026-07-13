@@ -60,6 +60,16 @@ def _on_startup() -> None:
     multi-MB auth.json at process start — that freezes WSL. We only do a
     cheap normalize here; refresh/probe are staggered + concurrency-capped.
     """
+    # This must run before any worker touches persisted credentials. Failure is
+    # fatal: serving with group/world-readable secret files is not acceptable.
+    from secure_storage import migrate_secret_permissions
+
+    permission_result = migrate_secret_permissions(strict=True)
+    print(
+        "  secret permissions: secured "
+        f"directories={permission_result['directories']} "
+        f"files={permission_result['files']}"
+    )
     try:
         from oidc_auth import normalize_auth_file_keys
         from auth_store import read_auth_map
@@ -1510,13 +1520,10 @@ async def health():
         pool = account_pool.pool_summary(include_accounts=False)
         # Health must stay a bounded read-only route. Do not make an OIDC
         # refresh request while resolving the representative account.
-        creds = account_pool.acquire(auto_refresh=False)
+        account_pool.acquire(auto_refresh=False)
         return {
             "status": "ok",
             "version": APP_VERSION,
-            "email": creds.email,
-            "expires_at": creds.expires_at,
-            "auth_key": creds.auth_key,
             "upstream": UPSTREAM_BASE,
             "auth_required": apikeys.auth_required(),
             "account_mode": pool.get("mode"),
@@ -1531,11 +1538,12 @@ async def health():
             "registration": reg,
         }
     except AuthError as e:
+        _ = e
         return JSONResponse(
             status_code=503,
             content={
                 "status": "auth_error",
-                "message": str(e),
+                "message": "credentials unavailable",
                 "version": APP_VERSION,
                 "registration": reg,
             },
@@ -1732,8 +1740,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 tool_calls=tool_calls,
                 usage=usage,
             )
-            # non-standard but useful for multi-account debugging
-            result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
             hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
             if isinstance(hc_stats, dict):
@@ -1854,6 +1860,7 @@ async def _stream_proxy_with_failover(
                             error=err_text,
                             status_code=resp.status_code,
                             model=model,
+                            headers=resp.headers,
                         )
                         last_err = f"Upstream {resp.status_code}: {err_text}"
                         # try next account if retryable and more remain
@@ -2605,8 +2612,6 @@ async def anthropic_messages(
                 model=model,
                 message_id=message_id,
             )
-            # non-standard debug fields (ignored by strict SDKs that allow extra)
-            result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
             if conv_fp:
                 result["x_grok2api_conversation_fp"] = conv_fp
@@ -2706,6 +2711,7 @@ async def _stream_anthropic_with_failover(
                             error=err_text,
                             status_code=resp.status_code,
                             model=model,
+                            headers=resp.headers,
                         )
                         last_err = f"Upstream {resp.status_code}: {err_text}"
                         if _retryable_status(resp.status_code) and idx < len(

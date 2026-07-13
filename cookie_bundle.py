@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from registration_jobs import experiment_bucket, in_experiment
+from secure_storage import atomic_write_private_json, ensure_private_dir
 
 SSO_NAMES = frozenset({"sso", "sso-rw"})
 CF_NAMES = frozenset({"cf_clearance", "__cf_bm"})
@@ -62,12 +63,7 @@ def default_bundle_dir() -> Path:
 
 def ensure_bundle_dir(path: Path | None = None) -> Path:
     root = path or default_bundle_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(root, 0o700)
-    except OSError:
-        pass
-    return root
+    return ensure_private_dir(root)
 
 
 def resolve_mode_for_session(session_id: str) -> str:
@@ -213,17 +209,7 @@ def write_bundle(
         "cookies": items,
         "names": cookie_names(items),
     }
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    atomic_write_private_json(path, payload)
     return {
         "ok": True,
         "bundle_id": bundle_id,
@@ -331,24 +317,52 @@ def experiment_info(session_id: str) -> dict[str, Any]:
     }
 
 
-def sweep_expired(*, root: Path | None = None, max_age_sec: float | None = None) -> int:
+def sweep_expired(
+    *,
+    root: Path | None = None,
+    max_age_sec: float | None = None,
+    max_delete: int = 200,
+    protected_paths: Iterable[str | Path] = (),
+    now: float | None = None,
+) -> int:
     """Delete expired cookie bundle files without requiring a read."""
     base = Path(root) if root else bundle_root()
     if max_age_sec is None:
         try:
-            max_age_sec = float(os.getenv("GROK2API_COOKIE_BUNDLE_TTL_SEC", "86400") or 86400)
+            max_age_sec = float(
+                os.getenv("GROK2API_COOKIE_BUNDLE_TTL_SEC", "172800") or 172800
+            )
         except (TypeError, ValueError):
-            max_age_sec = 86400.0
+            max_age_sec = 172800.0
     if not base.is_dir():
         return 0
-    now = time.time()
+    current = time.time() if now is None else float(now)
+    limit = max(0, int(max_delete))
+    if limit == 0:
+        return 0
+    protected = set()
+    for raw in protected_paths:
+        try:
+            protected.add(str(Path(raw).resolve(strict=False)))
+        except OSError:
+            continue
     deleted = 0
+    candidates: list[tuple[float, Path]] = []
     for path in base.glob("*.json"):
         try:
-            age = now - path.stat().st_mtime
-            if age > max_age_sec:
-                path.unlink(missing_ok=True)
-                deleted += 1
+            if path.is_symlink() or not path.is_file():
+                continue
+            if str(path.resolve(strict=False)) in protected:
+                continue
+            mtime = path.stat().st_mtime
+            if current - mtime > max_age_sec:
+                candidates.append((mtime, path))
+        except OSError:
+            continue
+    for _mtime, path in sorted(candidates, key=lambda item: (item[0], item[1].name))[:limit]:
+        try:
+            path.unlink(missing_ok=True)
+            deleted += 1
         except OSError:
             continue
     return deleted

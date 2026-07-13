@@ -90,7 +90,10 @@ class _UrllibTransport:
         set_cookies = resp.headers.get_all("set-cookie") or []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         if self._debug:
-            print(f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, transport=urllib)")
+            print(
+                f"  <- {status} {method} ({len(raw)} bytes, "
+                f"{len(set_cookies)} set-cookie, transport=urllib)"
+            )
         return status, hdrs, set_cookies, raw
 
     def close(self): pass
@@ -761,7 +764,7 @@ class XConsoleAuthClient:
             )
             if self.debug:
                 print(
-                    f"  [sso] {label} HTTP {status} {url[:64]}, "
+                    f"  [sso] {label} HTTP {status}, "
                     f"set-cookies={len(set_cookies or [])}"
                 )
             from .sso import parse_sso_from_set_cookies, parse_sso_token_from_text
@@ -790,7 +793,7 @@ class XConsoleAuthClient:
                     return token
         except Exception as exc:
             if self.debug:
-                print(f"  [sso] {label} failed: {exc}")
+                print(f"  [sso] {label} failed: {type(exc).__name__}")
         return self._read_sso_from_jar()
 
     def _fetch_sso_via_grok_home(self) -> Optional[str]:

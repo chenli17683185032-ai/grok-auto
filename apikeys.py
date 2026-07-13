@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from config import API_KEY, KEYS_FILE, REQUIRE_API_KEY
+from secure_storage import atomic_write_private_json, ensure_private_dir
 
 
 _lock = threading.RLock()
+
+
+class KeyStoreCorrupt(RuntimeError):
+    """An existing key store is unreadable and must not be overwritten."""
 
 
 @dataclass
@@ -52,7 +57,7 @@ class ApiKeyRecord:
 
 
 def _ensure_parent(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
 
 
 def _hash_key(raw: str) -> str:
@@ -68,19 +73,17 @@ def _load_raw() -> dict[str, Any]:
         return {"keys": []}
     try:
         data = json.loads(KEYS_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return {"keys": []}
-        data.setdefault("keys", [])
-        return data
-    except (OSError, json.JSONDecodeError):
-        return {"keys": []}
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise KeyStoreCorrupt("existing API key store is unreadable") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("keys", []), list):
+        raise KeyStoreCorrupt("existing API key store has an invalid root")
+    data.setdefault("keys", [])
+    return data
 
 
 def _save_raw(data: dict[str, Any]) -> None:
     _ensure_parent(KEYS_FILE)
-    tmp = KEYS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(KEYS_FILE)
+    atomic_write_private_json(KEYS_FILE, data, pretty=True)
 
 
 def _from_dict(d: dict[str, Any]) -> ApiKeyRecord:
@@ -208,7 +211,10 @@ def verify_key(raw: str | None) -> ApiKeyRecord | None:
 
     h = _hash_key(raw)
     with _lock:
-        data = _load_raw()
+        try:
+            data = _load_raw()
+        except KeyStoreCorrupt:
+            return None
         for k in data["keys"]:
             if not k.get("enabled", True):
                 continue
@@ -223,7 +229,12 @@ def verify_key(raw: str | None) -> ApiKeyRecord | None:
 
 def has_any_keys() -> bool:
     with _lock:
-        data = _load_raw()
+        try:
+            data = _load_raw()
+        except KeyStoreCorrupt:
+            # Treat an unreadable store as populated so legacy "auto" callers
+            # cannot turn a corrupt credential store into open access.
+            return True
         if API_KEY:
             return True
         return any(k.get("enabled", True) for k in data["keys"])
@@ -231,18 +242,27 @@ def has_any_keys() -> bool:
 
 def auth_required() -> bool:
     """Whether /v1 must present a valid API key."""
-    mode = (REQUIRE_API_KEY or "auto").lower()
-    if mode in ("1", "true", "yes", "on"):
+    try:
+        _load_raw()
+    except KeyStoreCorrupt:
+        # Corruption always overrides an explicit dev-open setting.  An
+        # operator must repair/remove the store before access can be opened.
         return True
+    mode = (REQUIRE_API_KEY or "1").lower()
     if mode in ("0", "false", "no", "off"):
         return False
-    # auto: require if any key exists
-    return has_any_keys()
+    # Production is fail-closed.  Open local mode must be an explicit 0/off.
+    return True
 
 
 def stats() -> dict[str, Any]:
     with _lock:
-        data = _load_raw()
+        try:
+            data = _load_raw()
+            store_ok = True
+        except KeyStoreCorrupt:
+            data = {"keys": []}
+            store_ok = False
         keys = [_from_dict(k) for k in data["keys"]]
         return {
             "total": len(keys),
@@ -251,4 +271,5 @@ def stats() -> dict[str, Any]:
             "total_requests": sum(k.request_count for k in keys),
             "auth_required": auth_required(),
             "legacy_env_key": bool(API_KEY),
+            "store_ok": store_ok,
         }

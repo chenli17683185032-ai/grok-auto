@@ -79,16 +79,23 @@ class RegistrationMetrics:
                 conn.commit()
             finally:
                 conn.close()
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
+            self._chmod_storage_files()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        self._chmod_storage_files()
         return conn
+
+    def _chmod_storage_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{self.db_path}{suffix}")
+            try:
+                if path.exists() and not path.is_symlink():
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
 
     def emit(
         self,
@@ -177,10 +184,7 @@ class RegistrationMetrics:
                     conn.close()
                 except Exception:
                     pass
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
+            self._chmod_storage_files()
 
     def count_event(self, event: str, *, since: float | None = None) -> int:
         with self._lock:
@@ -217,6 +221,62 @@ class RegistrationMetrics:
             "first_refresh_ok",
         ]
         return {e: self.count_event(e, since=since) for e in events}
+
+    def purge(
+        self,
+        *,
+        before: float,
+        max_rows: int = 200_000,
+        limit: int = 200,
+    ) -> dict[str, int]:
+        """Bound retention by age and row cap without a long SQLite lock."""
+        batch = max(0, int(limit))
+        row_cap = max(0, int(max_rows))
+        if batch == 0:
+            return {"deleted": 0, "remaining": 0}
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                old = conn.execute(
+                    """
+                    DELETE FROM events
+                    WHERE id IN (
+                      SELECT id FROM events WHERE ts < ? ORDER BY ts ASC, id ASC LIMIT ?
+                    )
+                    """,
+                    (float(before), batch),
+                )
+                deleted = max(0, int(old.rowcount or 0))
+                remaining = int(
+                    conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()["c"]
+                )
+                capacity = max(0, batch - deleted)
+                overflow = max(0, remaining - row_cap)
+                if capacity and overflow:
+                    trim = min(capacity, overflow)
+                    capped = conn.execute(
+                        """
+                        DELETE FROM events
+                        WHERE id IN (
+                          SELECT id FROM events ORDER BY ts ASC, id ASC LIMIT ?
+                        )
+                        """,
+                        (trim,),
+                    )
+                    removed = max(0, int(capped.rowcount or 0))
+                    deleted += removed
+                    remaining -= removed
+                conn.execute("COMMIT")
+                return {"deleted": deleted, "remaining": max(0, remaining)}
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                conn.close()
 
     def sample_resources(self) -> dict[str, Any]:
         """Best-effort host resource sample (Linux /proc; else empty)."""

@@ -53,12 +53,20 @@ def adaptive_enabled() -> bool:
 class _LeaseHeartbeat:
     """Background lease renewer for long device-flow / probe work."""
 
-    def __init__(self, controller: "RegistrationController", job: RegistrationJob, *, lease_sec: float = 300.0, every: float = 30.0):
+    def __init__(
+        self,
+        controller: "RegistrationController",
+        job: RegistrationJob,
+        *,
+        lease_sec: float = 300.0,
+        every: float = 30.0,
+    ):
         self.controller = controller
         self.job = job
         self.lease_sec = lease_sec
-        self.every = max(5.0, every)
+        self.every = max(0.05, every)
         self._stop = threading.Event()
+        self.cancel_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.alive = True
 
@@ -69,10 +77,18 @@ class _LeaseHeartbeat:
 
     def _run(self) -> None:
         while not self._stop.wait(self.every):
-            if not self.controller._heartbeat(self.job, lease_sec=self.lease_sec):
+            try:
+                renewed = self.controller._heartbeat(self.job, lease_sec=self.lease_sec)
+            except Exception:  # noqa: BLE001
+                renewed = False
+            if not renewed:
                 self.alive = False
+                self.cancel_event.set()
                 self._stop.set()
                 return
+
+    def lease_guard(self) -> bool:
+        return self.alive and not self.cancel_event.is_set()
 
     def __exit__(self, *exc) -> None:
         self._stop.set()
@@ -133,7 +149,7 @@ class RegistrationController:
             registry.bind_existing(session_id, route_id)
             rid = route_id
         elif route_sticky_enabled():
-            rid = registry.assign_route(session_id)
+            rid = registry.assign_round_robin(session_id)
         else:
             # Legacy default: always route-1 (single global proxy semantics)
             rid = "route-1"
@@ -196,7 +212,7 @@ class RegistrationController:
             payload={"email": email, "owner": "mint_queue"},
         )
         try:
-            self.queue.enqueue(job)
+            job = self.queue.enqueue(job)
         except Exception:
             # Compensating action: do not leave mint-owned orphan without a job.
             if pending_path:
@@ -221,16 +237,16 @@ class RegistrationController:
             "sso_obtained",
             session_id=session_id,
             job_id=job.job_id,
-            route_id=rid,
-            cookie_mode=cookie_mode,
+            route_id=job.route_id,
+            cookie_mode=job.cookie_mode,
             ok=True,
         )
         metrics_emit(
             "mint_queued",
             session_id=session_id,
             job_id=job.job_id,
-            route_id=rid,
-            cookie_mode=cookie_mode,
+            route_id=job.route_id,
+            cookie_mode=job.cookie_mode,
         )
         return job
 
@@ -285,20 +301,27 @@ class RegistrationController:
 
             sig = inspect.signature(token_fn)
             params = sig.parameters
+            accepts_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
         except (TypeError, ValueError):
             params = {}
+            accepts_kwargs = False
 
-        if "route_id" in params and route is not None:
+        def accepts(name: str) -> bool:
+            return name in params or accepts_kwargs
+
+        if accepts("route_id") and route is not None:
             kwargs["route_id"] = route.route_id
-        if "approver_endpoint" in params and route is not None:
+        if accepts("approver_endpoint") and route is not None:
             kwargs["approver_endpoint"] = route.approver
-        if "proxy" in params and route is not None:
+        if accepts("proxy") and route is not None:
             kwargs["proxy"] = route.token_proxy
-        if "cookie_bundle_path" in params:
+        if accepts("cookie_bundle_path"):
             kwargs["cookie_bundle_path"] = job.cookie_bundle_path
-        if "cookie_mode" in params:
+        if accepts("cookie_mode"):
             kwargs["cookie_mode"] = job.cookie_mode
-        if "extra_cookies" in params and job.cookie_bundle_path:
+        if accepts("extra_cookies") and job.cookie_bundle_path:
             try:
                 import cookie_bundle as cb
 
@@ -312,16 +335,25 @@ class RegistrationController:
                     ]
             except Exception:
                 pass
-        if "parallel_poll" in params:
+        if accepts("parallel_poll"):
             kwargs["parallel_poll"] = parallel_token_poll_enabled()
 
         try:
-            with _LeaseHeartbeat(self, job, lease_sec=300.0, every=20.0) as hb:
+            heartbeat_every = float(
+                os.getenv("GROK2API_LEASE_HEARTBEAT_SEC", "20") or 20
+            )
+            with _LeaseHeartbeat(
+                self, job, lease_sec=300.0, every=heartbeat_every
+            ) as hb:
+                if accepts("cancel_event"):
+                    kwargs["cancel_event"] = hb.cancel_event
+                if accepts("lease_guard"):
+                    kwargs["lease_guard"] = hb.lease_guard
                 if kwargs:
                     token = token_fn(sso, **kwargs)
                 else:
                     token = token_fn(sso)
-                if not hb.alive:
+                if not hb.lease_guard():
                     print(f"[mint-worker] heartbeat lost mid-token job={job.job_id}", flush=True)
                     return job
         except Exception as exc:  # noqa: BLE001
@@ -374,9 +406,17 @@ class RegistrationController:
             job.transition(JobState.PROBE_RUNNING)
             if not self._fenced_save(job):
                 return job
-            with _LeaseHeartbeat(self, job, lease_sec=300.0, every=20.0) as hb:
-                probe_result = self._run_probe(token, job=job, probe_fn=probe_fn)
-                if not hb.alive:
+            with _LeaseHeartbeat(
+                self, job, lease_sec=300.0, every=heartbeat_every
+            ) as hb:
+                probe_result = self._run_probe(
+                    token,
+                    job=job,
+                    probe_fn=probe_fn,
+                    cancel_event=hb.cancel_event,
+                    lease_guard=hb.lease_guard,
+                )
+                if not hb.lease_guard():
                     print(f"[mint-worker] heartbeat lost mid-probe job={job.job_id}", flush=True)
                     return job
             if not probe_result.get("ok"):
@@ -406,6 +446,8 @@ class RegistrationController:
                 return job
 
         try:
+            if not self._heartbeat(job):
+                return job
             if import_entry is not None:
                 result = import_entry(token, job.session_id)
             else:
@@ -475,9 +517,35 @@ class RegistrationController:
         *,
         job: RegistrationJob,
         probe_fn: Callable[..., dict] | None = None,
+        cancel_event: threading.Event | None = None,
+        lease_guard: Callable[[], bool] | None = None,
     ) -> dict:
+        def cancelled() -> bool:
+            return bool(
+                (cancel_event is not None and cancel_event.is_set())
+                or (lease_guard is not None and not lease_guard())
+            )
+
+        if cancelled():
+            return {"ok": False, "error": "lease_cancelled"}
         if probe_fn is not None:
-            return probe_fn(token)
+            try:
+                import inspect
+
+                params = inspect.signature(probe_fn).parameters
+                accepts_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+                )
+            except (TypeError, ValueError):
+                params = {}
+                accepts_kwargs = False
+            kwargs: dict[str, Any] = {}
+            if "cancel_event" in params or accepts_kwargs:
+                kwargs["cancel_event"] = cancel_event
+            if "lease_guard" in params or accepts_kwargs:
+                kwargs["lease_guard"] = lease_guard
+            result = probe_fn(token, **kwargs)
+            return {"ok": False, "error": "lease_cancelled"} if cancelled() else result
         if _env_flag("GROK2API_MINT_SKIP_PROBE", "0"):
             return {"ok": True, "skipped": True}
         try:
@@ -523,6 +591,8 @@ class RegistrationController:
                 report_stats=False,
                 proxy=probe_proxy,
             )
+            if cancelled():
+                return {"ok": False, "error": "lease_cancelled"}
             ok = bool(result.get("ok") or result.get("available"))
             return {
                 "ok": ok,

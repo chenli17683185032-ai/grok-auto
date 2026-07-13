@@ -19,6 +19,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
+from secure_storage import atomic_write_private_json
+
 
 BASE_URL = os.getenv("GROK2API_PRODUCER_BASE_URL", "http://grokcli-2api:3000").rstrip("/")
 PASSWORD = os.getenv("GROK2API_ADMIN_PASSWORD", "")
@@ -113,17 +115,7 @@ class _SecretRedactingWriter:
 
 def _atomic_write_pending(path: Path, payload: dict[str, Any]) -> None:
     """Persist retry metadata without weakening the SSO file permissions."""
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    atomic_write_private_json(path, payload)
 
 
 
@@ -407,6 +399,13 @@ def _producer_state() -> dict[str, Any]:
         return {}
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _save_producer_state(state: dict[str, Any]) -> None:
     PRODUCER_STATE.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_pending(PRODUCER_STATE, state)
@@ -415,7 +414,7 @@ def _save_producer_state(state: dict[str, Any]) -> None:
 def _registration_domain() -> str | None:
     if not PRODUCER_DOMAINS:
         return None
-    imported_lifetime = max(0, int(_producer_state().get("imported_lifetime") or 0))
+    imported_lifetime = max(0, _safe_int(_producer_state().get("imported_lifetime")))
     return PRODUCER_DOMAINS[(imported_lifetime // DOMAIN_ROTATE_EVERY) % len(PRODUCER_DOMAINS)]
 
 
@@ -423,7 +422,9 @@ def _record_imported(count: int) -> None:
     if count <= 0:
         return
     state = _producer_state()
-    state["imported_lifetime"] = max(0, int(state.get("imported_lifetime") or 0)) + count
+    state["imported_lifetime"] = max(
+        0, _safe_int(state.get("imported_lifetime"))
+    ) + count
     state["updated_at"] = time.time()
     _save_producer_state(state)
 
@@ -549,7 +550,7 @@ def _is_effective_account(row: dict[str, Any]) -> bool:
         and not row.get("disabled_for_quota")
         and not row.get("quota_waiting")
         and not row.get("credential_suspended")
-        and not row.get("refresh_invalid")
+        and row.get("refresh_status") != "refresh_terminal"
         and row.get("has_refresh_token")
         and (not TARGET_MODEL or TARGET_MODEL not in blocked)
     )
@@ -588,10 +589,27 @@ def _pool_snapshot(token: str) -> dict[str, Any]:
 
 def _cleanup_reason(row: dict[str, Any]) -> tuple[str, float | None] | None:
     """Return only durable account-wide failures safe to consider deleting."""
-    if row.get("refresh_invalid"):
-        return "refresh_invalid", _as_timestamp(row.get("refresh_invalid_at"))
-    # quota_waiting / disabled_for_quota are NOT permanent failures — never delete
-    # accounts solely because free-usage 1M/24h is exhausted.
+    if (
+        row.get("refresh_status") == "refresh_terminal"
+        and _safe_int(row.get("refresh_failure_count")) >= 3
+        and row.get("refresh_confirmed_after_expiry") is True
+        and _as_timestamp(row.get("refresh_terminal_at")) is not None
+    ):
+        return "refresh_terminal", _as_timestamp(row.get("refresh_terminal_at"))
+    # Quota is eligible only after the quota state machine persisted every
+    # evidence gate.  A plain waiting flag is never sufficient.
+    if (
+        row.get("quota_status") == "quota_reset_failed"
+        and row.get("quota_cycle_id")
+        and row.get("quota_confirmation_cycle_id") == row.get("quota_cycle_id")
+        and _safe_int(row.get("quota_confirmation_count")) >= 3
+        and _safe_int(row.get("quota_grace_count")) >= 2
+        and _as_timestamp(row.get("quota_first_confirm_at")) is not None
+        and _as_timestamp(row.get("quota_last_confirm_at")) is not None
+        and row.get("quota_last_evidence") == "free_usage_exhausted"
+        and _as_timestamp(row.get("quota_terminal_at")) is not None
+    ):
+        return "quota_reset_failed", _as_timestamp(row.get("quota_terminal_at"))
     if row.get("quota_waiting") or row.get("disabled_for_quota"):
         return None
     if row.get("expired") and not row.get("has_refresh_token"):
@@ -624,7 +642,9 @@ def _cleanup_accounts(token: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             }
         else:
             observation["last_seen"] = now
-            observation["confirmations"] = int(observation.get("confirmations") or 0) + 1
+            observation["confirmations"] = _safe_int(
+                observation.get("confirmations")
+            ) + 1
         _cleanup_observations[account_id] = observation
 
         durable_since = marked_at or float(observation["first_seen"])
@@ -632,7 +652,7 @@ def _cleanup_accounts(token: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         observed_long_enough = (
             now - float(observation["first_seen"]) >= CLEANUP_CONFIRM_WINDOW_SEC
         )
-        confirmed = int(observation["confirmations"]) >= CLEANUP_CONFIRMATIONS
+        confirmed = _safe_int(observation.get("confirmations")) >= CLEANUP_CONFIRMATIONS
         if old_enough and observed_long_enough and confirmed:
             ready.append((account_id, reason))
 
@@ -692,6 +712,26 @@ def run_forever() -> None:
     clean_batch_streak = 0
     while True:
         try:
+            try:
+                import maintenance_retention
+
+                retention = maintenance_retention.run_if_due()
+                if retention.get("ran"):
+                    print(
+                        "[registration-producer] retention "
+                        f"queue={retention.get('queue_terminal_deleted', 0)} "
+                        f"metrics={retention.get('metrics_deleted', 0)} "
+                        f"cookie={retention.get('cookie_deleted', 0)} "
+                        f"pending={retention.get('pending_deleted', 0)} "
+                        f"ok={retention.get('ok', False)}",
+                        flush=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "[registration-producer] retention error="
+                    f"{type(exc).__name__}",
+                    flush=True,
+                )
             recovered, recovery_failed = _recover_pending_sso()
             _record_imported(recovered)
             if recovered or recovery_failed:

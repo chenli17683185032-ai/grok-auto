@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -36,8 +38,6 @@ _QUOTA_ERROR_RE = re.compile(
     r"run\s+out\s+of\s+credits|"
     r"out\s+of\s+credits|"
     r"spending[-_ ]?limit|"
-    r"personal-team-blocked|"
-    r"need\s+a\s+grok\s+subscription|"
     r"monthly\s+limit|"
     r"no\s+credits|"
     r"insufficient\s+credits|"
@@ -217,10 +217,17 @@ def parse_quota_reset_at(headers: Any = None, *, body: str = "") -> float | None
                 raw = get(key) or get(key.title()) or get(key.upper())
                 if raw is None:
                     continue
-                # HTTP-date Retry-After not fully parsed; numeric only here
                 try:
                     val = float(str(raw).strip())
                 except (TypeError, ValueError):
+                    if key.lower() == "retry-after":
+                        try:
+                            dt = parsedate_to_datetime(str(raw).strip())
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            return max(now, dt.timestamp())
+                        except (TypeError, ValueError, OverflowError):
+                            pass
                     continue
                 if val > 1e12:  # epoch ms
                     return val / 1000.0
@@ -270,10 +277,11 @@ def is_quota_error_message(error: str | None, status_code: int | None = None) ->
         return False
     if _QUOTA_ERROR_RE.search(text):
         return True
-    # 403 + spending/subscription style codes often mean no credits
+    # 403 + spending/billing style codes often mean no credits. Account blocks
+    # and subscription eligibility belong to the credential classifier.
     if status_code == 403 and any(
         k in text.lower()
-        for k in ("credit", "subscription", "billing", "spending", "limit", "quota")
+        for k in ("credit", "billing", "spending", "limit", "quota")
     ):
         return True
     return False
@@ -387,7 +395,7 @@ def handle_upstream_error_for_quota(
     On upstream failure: if message indicates free-usage/quota exhaustion,
     mark quota_waiting until reset (default +24h). Never permanent delete.
     """
-    if not account_id or not is_free_usage_exhausted_message(error, status_code):
+    if not account_id or not is_quota_error_message(error, status_code):
         return None
     reason = f"上游额度等待 (HTTP {status_code}): {(error or '')[:120]}"
     reset_at = parse_quota_reset_at(headers, body=error or "")
@@ -724,6 +732,7 @@ def probe_free_usage_for_creds(
             "error_class": "credential",
             "exhausted": False,
             "free_usage_ok": False,
+            "error": text[:400] or f"HTTP {status}",
         }
 
     if exhausted:
@@ -754,6 +763,7 @@ def probe_free_usage_for_creds(
             "ok": False,
             "inconclusive": True,
             "error_class": "rate_limited",
+            "error": text[:400] or "HTTP 429",
         }
 
     if status >= 500:
@@ -762,6 +772,7 @@ def probe_free_usage_for_creds(
             "ok": False,
             "inconclusive": True,
             "error_class": f"upstream_{status}",
+            "error": text[:400] or f"HTTP {status}",
         }
 
     return {
@@ -769,4 +780,5 @@ def probe_free_usage_for_creds(
         "ok": False,
         "inconclusive": True,
         "error_class": f"http_{status}",
+        "error": text[:400] or f"HTTP {status}",
     }

@@ -43,6 +43,26 @@ from .xai_oauth import (
     generate_code_verifier,
 )
 
+
+def _redact_debug_message(message: str) -> str:
+    text = re.sub(
+        r"eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+){0,2}",
+        "<redacted-jwt>",
+        message or "",
+    )
+    text = re.sub(
+        r"(?i)([?&](?:code|token|key|secret|state|q|jwt)=)[^&#\s]+",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(session_jwt|access_token|refresh_token|device_code|user_code)"
+        r"\s*[:=]\s*\S+",
+        r"\1=<redacted>",
+        text,
+    )
+    return text
+
 TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 CREATE_SESSION_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateSession"
 CREATE_COOKIE_SETTER_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
@@ -222,7 +242,7 @@ class ProtocolOAuthClient:
 
     def _log(self, msg: str) -> None:
         if self.debug:
-            print(f"  [oauth-protocol] {msg}")
+            print(f"  [oauth-protocol] {_redact_debug_message(msg)}")
 
     def _get(self, url: str, *, allow_redirects: bool = True, headers: Optional[Dict[str, str]] = None):
         h = {
@@ -552,7 +572,7 @@ class ProtocolOAuthClient:
             raise RuntimeError("authorization failed: state mismatch")
         code = (qs.get("code") or [""])[0]
         if not code:
-            raise RuntimeError(f"authorization failed: missing code in {url[:200]}")
+            raise RuntimeError("authorization failed: missing code in redirect")
         return code
 
     def login(
@@ -620,13 +640,13 @@ class ProtocolOAuthClient:
                 success = str(cfg.get("success_url") or "")
             if token:
                 self._set_sso_cookie(token)
-                self._log(f"applied set-cookie token as sso ({token[:16]}...)")
+                self._log("applied set-cookie token as sso")
             # Hit the set-cookie endpoint so domain cookies are written.
             resp = self._get(setter_url, allow_redirects=False)
             loc = resp.headers.get("location") or resp.headers.get("Location") or ""
             if loc:
                 nxt = urljoin(setter_url, loc)
-                self._log(f"set-cookie Location → {nxt[:160]}")
+                self._log("set-cookie redirect present")
                 return nxt
             if success:
                 return success
@@ -722,7 +742,10 @@ class ProtocolOAuthClient:
                     # Only GET set-cookie; use response Set-Cookie (do not clobber sso with config.token).
                     resp = self._get(current, allow_redirects=False)
                     loc = resp.headers.get("location") or resp.headers.get("Location") or ""
-                    self._log(f"set-cookie HTTP {resp.status_code} loc={(loc or '')[:120]}")
+                    self._log(
+                        f"set-cookie HTTP {resp.status_code} "
+                        f"location_present={bool(loc)}"
+                    )
                     if loc:
                         current = urljoin(current, loc)
                         continue

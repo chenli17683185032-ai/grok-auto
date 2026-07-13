@@ -39,6 +39,13 @@ def _mask_token(token: str | None) -> str:
     return token[:6] + "..." + token[-4:]
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def list_accounts() -> list[dict[str, Any]]:
     """List all session entries in auth.json (no full tokens)."""
     data = read_auth_map()
@@ -68,13 +75,16 @@ def list_accounts() -> list[dict[str, Any]]:
                 "expires_at": exp_f,
                 "expired": expired,
                 "has_refresh_token": bool(entry.get("refresh_token")),
-                # Lifecycle flags are safe to expose (the secret token is not).
-                # The headless producer uses them to distinguish permanent
-                # refresh revocation from a temporary expired access token.
-                "refresh_invalid": bool(entry.get("refresh_invalid")),
-                "refresh_invalid_at": entry.get("refresh_invalid_at"),
-                "refresh_invalid_reason": (
-                    str(entry.get("refresh_invalid_reason") or "")[:300] or None
+                "refresh_status": entry.get("refresh_status") or "active",
+                "refresh_failure_count": _safe_int(
+                    entry.get("refresh_failure_count")
+                ),
+                "refresh_first_failed_at": entry.get("refresh_first_failed_at"),
+                "refresh_last_failed_at": entry.get("refresh_last_failed_at"),
+                "refresh_next_retry_at": entry.get("refresh_next_retry_at"),
+                "refresh_terminal_at": entry.get("refresh_terminal_at"),
+                "refresh_confirmed_after_expiry": bool(
+                    entry.get("refresh_confirmed_after_expiry")
                 ),
                 "token_hint": _mask_token(token if isinstance(token, str) else None),
                 "first_name": entry.get("first_name"),

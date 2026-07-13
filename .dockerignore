@@ -3,9 +3,13 @@
 __pycache__
 **/__pycache__
 *.pyc
-.venv
+.venv*
+.venv_sys
 venv
 data
+test-output
+artifacts
+_compare_grok_register
 *.log
 .env
 .env.*
@@ -16,4 +20,4 @@ vendors
 **/oauth_output
 **/accounts_output
 **/cliproxyapi_auth
-integrations/
+/integrations/ruyipage/

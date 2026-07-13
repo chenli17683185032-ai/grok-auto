@@ -71,13 +71,29 @@ def _clean_old_sessions() -> None:
 
 
 def _redact_secret_text(value: str) -> str:
-    """Strip JWTs, proxy userinfo, and long secret-looking tokens from free text."""
+    """Strip credential fields and secret URL parameters from free text."""
     if not value:
         return value
     text = value
-    text = re.sub(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){0,2}", "<redacted-jwt>", text)
-    text = re.sub(r"(?i)(password|passwd|pwd|refresh_token|access_token|api[_-]?key|yescaptcha[^\s:=]*)\s*[:=]\s*\S+", r"\1=<redacted>", text)
     text = re.sub(r"(?i)://([^/@\s]+@)", "://<redacted>@", text)
+    text = re.sub(
+        r"eyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+){0,2}",
+        "<redacted-jwt>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:code|device_code|user_code|token|key|secret|password|"
+        r"signature|sig|state|q|jwt)=)[^&#\s\"']+",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(\b(?:password|passwd|pwd|device_code|user_code|refresh_token|"
+        r"access_token|api[_-]?key|yescaptcha[^\s:=]*)\b\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^,\s&]+)",
+        r"\1<redacted>",
+        text,
+    )
     text = re.sub(r"(?i)\b[A-Za-z0-9_-]{32,}\b", "<redacted-token>", text)
     return text
 
@@ -96,6 +112,8 @@ def _compact_value(value: Any, *, depth: int = 0) -> Any:
                 for x in (
                     "password",
                     "passwd",
+                    "device_code",
+                    "user_code",
                     "refresh_token",
                     "access_token",
                     "api_key",
@@ -104,6 +122,10 @@ def _compact_value(value: Any, *, depth: int = 0) -> Any:
                     "cookie",
                     "authorization",
                     "secret",
+                    "verification_uri_complete",
+                    "verification_url",
+                    "proxy_username",
+                    "proxy_password",
                 )
             ):
                 if lk in ("sso", "sso_cookie"):
@@ -828,7 +850,10 @@ def _run_registration(
             print(f"[grok-build-auth] create_account HTTP={http_status}")
             print(f"[grok-build-auth] create_account set-cookies count={len(sc)}")
             print(f"[grok-build-auth] create_account ok={bool(getattr(res, 'ok', False))}")
-            print(f"[grok-build-auth] create_account error={signup_err!r}")
+            print(
+                "[grok-build-auth] create_account error="
+                f"{_redact_secret_text(str(signup_err))!r}"
+            )
             print(f"[grok-build-auth] create_account rsc_body_len={len(rsc_body)}")
             print(f"[grok-build-auth] adapter_build={ADAPTER_BUILD}")
             sess["create_account_http"] = http_status
@@ -901,7 +926,10 @@ def _run_registration(
                 email="", password="", save=False, retries=4
             )
         except Exception as sso_fetch_err:  # noqa: BLE001
-            print(f"[grok-build-auth] fetch_sso_token error: {sso_fetch_err}")
+            print(
+                "[grok-build-auth] fetch_sso_token error: "
+                f"{type(sso_fetch_err).__name__}"
+            )
 
         if not sso:
             try:
@@ -932,7 +960,10 @@ def _run_registration(
                         rsc_body, email="", password="", save=False
                     )
             except Exception as recover_err:  # noqa: BLE001
-                print(f"[grok-build-auth] SSO recover failed: {recover_err}")
+                print(
+                    "[grok-build-auth] SSO recover failed: "
+                    f"{type(recover_err).__name__}"
+                )
 
         # Current xAI create_account often returns only RSC chunks + CF cookies,
         # with no set-cookie JWT chain. Fall back to password CreateSession and
@@ -1087,29 +1118,20 @@ def _run_registration(
 
         # Legacy inline path only when PIPELINE_V2=0
         pending_dir = Path(os.getenv("GROK2API_DATA_DIR", "data")) / "pending_sso"
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(pending_dir, 0o700)
-        except OSError:
-            pass
+        from secure_storage import atomic_write_private_json, ensure_private_dir
+
+        ensure_private_dir(pending_dir)
         pending_path = pending_dir / f"{sid}.json"
-        pending_path.write_text(
-            json.dumps(
-                {
-                    "session_id": sid,
-                    "email": email,
-                    "sso": sso,
-                    "created_at": time.time(),
-                    "owner": "legacy_inline",
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
+        atomic_write_private_json(
+            pending_path,
+            {
+                "session_id": sid,
+                "email": email,
+                "sso": sso,
+                "created_at": time.time(),
+                "owner": "legacy_inline",
+            },
         )
-        try:
-            os.chmod(pending_path, 0o600)
-        except OSError:
-            pass
 
         token_kwargs: dict[str, Any] = {}
         try:

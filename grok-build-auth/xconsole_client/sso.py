@@ -288,7 +288,7 @@ class SSOExtractor:
                     token, email=email, password=password, output_dir=output_dir
                 )
                 if self.debug:
-                    print(f"  [sso] saved to: {path}")
+                    print("  [sso] saved=true")
             return token
 
         # 1. collect all candidate hop URLs from RSC body
@@ -313,8 +313,6 @@ class SSOExtractor:
 
         if self.debug:
             print(f"  [sso] candidate hop URLs: {len(hop_urls)}")
-            for u in hop_urls[:5]:
-                print(f"  [sso]  - {u[:100]}")
 
         # 2. expand each hop with JWT success_url if present
         expanded: List[str] = []
@@ -343,7 +341,7 @@ class SSOExtractor:
         set_cookies: List[str] = []
         last_exc: Optional[BaseException] = None
         token = None
-        for hop in list(hop_urls):
+        for hop_index, hop in enumerate(list(hop_urls), start=1):
             for attempt in range(2):
                 try:
                     try:
@@ -357,7 +355,7 @@ class SSOExtractor:
                     last_exc = None
                     if self.debug:
                         print(
-                            f"  [sso] hop HTTP {_status} {hop[:64]}..., "
+                            f"  [sso] hop={hop_index} HTTP {_status}, "
                             f"set-cookies={len(set_cookies or [])}"
                         )
                     # Follow redirects if present (303/302 often carries SSO)
@@ -382,14 +380,17 @@ class SSOExtractor:
                 except Exception as exc:
                     last_exc = exc
                     if self.debug:
-                        print(f"  [sso] request failed (attempt {attempt + 1}): {exc}")
+                        print(
+                            "  [sso] request failed "
+                            f"(attempt {attempt + 1}): {type(exc).__name__}"
+                        )
                     if attempt == 0:
                         import time as _time
                         _time.sleep(0.4)
             if token:
                 break
         if not token and last_exc is not None and self.debug:
-            print(f"  [sso] request failed: {last_exc}")
+            print(f"  [sso] request failed: {type(last_exc).__name__}")
 
         # 4. prefer Set-Cookie header, then cookie jar
         if not token:
@@ -400,7 +401,7 @@ class SSOExtractor:
             path = save_sso(token, email=email, password=password,
                             output_dir=output_dir)
             if self.debug:
-                print(f"  [sso] saved to: {path}")
+                print("  [sso] saved=true")
 
         return token
 
@@ -426,7 +427,7 @@ class SSOExtractor:
                 if name == "sso":
                     val = str(getattr(cookie, "value", ""))
                     if self.debug:
-                        print(f"  [sso] extracted: {val[:60]}...")
+                        print("  [sso] extracted=true")
                     return val
         return None
 

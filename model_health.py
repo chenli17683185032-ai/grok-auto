@@ -61,10 +61,7 @@ _MODEL_UNAVAILABLE_RE = re.compile(
     r"model[_ -]?access[_ -]?denied|"
     r"cannot\s+use\s+(?:this\s+)?model|"
     r"disabled\s+model|"
-    r"model\s+disabled|"
-    r"free-usage-exhausted|"
-    r"usage[_ -]?exhausted|"
-    r"used\s+all\s+the\s+included"
+    r"model\s+disabled"
     r")",
     re.IGNORECASE,
 )
@@ -77,11 +74,7 @@ _ACCOUNT_BLOCK_RE = re.compile(
     r"account[_ -]?suspended|"
     r"account[_ -]?disabled|"
     r"personal-team-blocked|"
-    r"need\s+a\s+grok\s+subscription|"
-    r"run\s+out\s+of\s+credits|"
-    r"out\s+of\s+credits|"
-    r"usage[_ -]?limit[_ -]?reached|"
-    r"usage[_ -]?pool[_ -]?exhausted"
+    r"need\s+a\s+grok\s+subscription"
     r")",
     re.IGNORECASE,
 )

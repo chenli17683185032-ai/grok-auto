@@ -29,6 +29,7 @@ grokcli-2api.env
 test-output/
 artifacts/
 _compare_grok_register/
+/integrations/ruyipage/
 
 .venv311/
 

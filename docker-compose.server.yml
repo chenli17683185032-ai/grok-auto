@@ -2,14 +2,21 @@ name: grokcli-2api
 
 x-common-env: &common-env
   env_file:
-    - path: .env
+    - path: "${GROK2API_ENV_FILE:-.env}"
       required: true
   restart: unless-stopped
 
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   grok-mihomo:
-    image: metacubex/mihomo:latest
+    image: "${GROK2API_MIHOMO_IMAGE:-metacubex/mihomo:v1.19.28}"
     restart: unless-stopped
+    logging: *json-logging
     command: ["-d", "/root/.config/mihomo"]
     volumes:
       - "${GROK2API_MIHOMO_CONFIG_DIR:-/opt/new-api/mihomo}:/root/.config/mihomo:ro"
@@ -23,8 +30,9 @@ services:
       start_period: 20s
 
   grok-mihomo-2:
-    image: metacubex/mihomo:latest
+    image: "${GROK2API_MIHOMO_IMAGE:-metacubex/mihomo:v1.19.28}"
     restart: unless-stopped
+    logging: *json-logging
     command: ["-d", "/root/.config/mihomo"]
     volumes:
       - "${GROK2API_MIHOMO2_CONFIG_DIR:-./mihomo-2}:/root/.config/mihomo:ro"
@@ -42,7 +50,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: grokcli-2api:server
+    image: "${GROK2API_APP_IMAGE:-grokcli-2api:2026.07.13-round8}"
+    logging: *json-logging
     environment:
       GROK2API_HOST: 0.0.0.0
       GROK2API_PORT: "3000"
@@ -51,7 +60,11 @@ services:
       GROK2API_REQUIRE_API_KEY: "1"
       GROK2API_TOKEN_REFRESH_SKEW: "900"
       GROK2API_MODEL_HEALTH: "1"
+      GROK2API_PIPELINE_V2: "${GROK2API_PIPELINE_V2:-0}"
+      GROK2API_ROUTE_STICKY: "${GROK2API_ROUTE_STICKY:-0}"
       GROK2API_RUYIPAGE_APPROVERS: http://ruyipage-approver:8765,http://ruyipage-approver-2:8765
+      GROK2API_ROUTE1_PROXY: http://grok-mihomo:7890
+      GROK2API_ROUTE2_PROXY: http://grok-mihomo-2:7890
       NO_PROXY: 127.0.0.1,localhost,ruyipage-approver,ruyipage-approver-2,grokcli-2api
       GROK2API_XAI_PROXY: http://grok-mihomo:7890
       HTTP_PROXY: http://grok-mihomo:7890
@@ -63,8 +76,7 @@ services:
     networks:
       - default
       - new-api
-    # Target hard budget for Grok production stack is ~2.40 CPU total; prefer 0.40
-    # for the API when dual ruyiPage + dual mihomo are co-located (override via env).
+    # Default topology totals 2.45 CPU; pipeline-v2 totals 2.55 CPU.
     cpus: "${GROK2API_API_CPUS:-0.40}"
     mem_limit: "${GROK2API_API_MEMORY:-768m}"
     healthcheck:
@@ -82,13 +94,14 @@ services:
     build:
       context: ./integrations/ruyipage-runtime
       dockerfile: Dockerfile.headless
-    image: ruyipage-headless:server
+    image: "${GROK2API_RUYIPAGE_IMAGE:-ruyipage-headless:2026.07.13-round8}"
+    logging: *json-logging
     command: ["uvicorn", "device_approver:app", "--host", "0.0.0.0", "--port", "8765"]
     environment:
       RUYIPAGE_PROXY: http://grok-mihomo:7890
       HTTP_PROXY: http://grok-mihomo:7890
       HTTPS_PROXY: http://grok-mihomo:7890
-      NO_PROXY: 127.0.0.1,localhost,grokcli-2api,ruyipage-approver
+      NO_PROXY: 127.0.0.1,localhost,grokcli-2api,ruyipage-approver,ruyipage-approver-2
     volumes:
       # Cookie bundles + shared data for path-based inject (0600 files on host).
       - ./data:/app/data:ro
@@ -105,7 +118,8 @@ services:
   ruyipage-approver-2:
     restart: unless-stopped
     platform: linux/amd64
-    image: ruyipage-headless:server
+    image: "${GROK2API_RUYIPAGE_IMAGE:-ruyipage-headless:2026.07.13-round8}"
+    logging: *json-logging
     command: ["uvicorn", "device_approver:app", "--host", "0.0.0.0", "--port", "8765"]
     environment:
       RUYIPAGE_PROXY: http://grok-mihomo-2:7890
@@ -130,9 +144,12 @@ services:
 
   registration-producer:
     <<: *common-env
-    image: grokcli-2api:server
+    image: "${GROK2API_APP_IMAGE:-grokcli-2api:2026.07.13-round8}"
+    logging: *json-logging
     command: ["python", "registration_producer.py"]
     environment:
+      GROK2API_PIPELINE_V2: "${GROK2API_PIPELINE_V2:-0}"
+      GROK2API_ROUTE_STICKY: "${GROK2API_ROUTE_STICKY:-0}"
       GROK2API_PRODUCER_BASE_URL: http://grokcli-2api:3000
       GROK2API_PRODUCER_BATCH_SIZE: "${GROK2API_PRODUCER_BATCH_SIZE:-1}"
       GROK2API_PRODUCER_CONCURRENCY: "${GROK2API_PRODUCER_CONCURRENCY:-1}"
@@ -145,6 +162,8 @@ services:
       # Pending recovery runs the Device Flow converter inside this container,
       # so it needs the same sidecar pool and xAI egress as the API process.
       GROK2API_RUYIPAGE_APPROVERS: http://ruyipage-approver:8765,http://ruyipage-approver-2:8765
+      GROK2API_ROUTE1_PROXY: http://grok-mihomo:7890
+      GROK2API_ROUTE2_PROXY: http://grok-mihomo-2:7890
       GROK2API_PROXY: http://grok-mihomo:7890
       HTTP_PROXY: http://grok-mihomo:7890
       HTTPS_PROXY: http://grok-mihomo:7890
@@ -155,6 +174,13 @@ services:
       GROK2API_PENDING_MAX_PER_CYCLE: "${GROK2API_PENDING_MAX_PER_CYCLE:-2}"
       GROK2API_PENDING_RETRY_BASE_SEC: "${GROK2API_PENDING_RETRY_BASE_SEC:-120}"
       GROK2API_PENDING_RETRY_MAX_SEC: "${GROK2API_PENDING_RETRY_MAX_SEC:-3600}"
+      GROK2API_RETENTION_ENABLED: "${GROK2API_RETENTION_ENABLED:-1}"
+      GROK2API_RETENTION_INTERVAL_SEC: "${GROK2API_RETENTION_INTERVAL_SEC:-3600}"
+      GROK2API_QUEUE_RETENTION_SEC: "${GROK2API_QUEUE_RETENTION_SEC:-604800}"
+      GROK2API_METRICS_RETENTION_SEC: "${GROK2API_METRICS_RETENTION_SEC:-604800}"
+      GROK2API_TEMP_FILE_TTL_SEC: "${GROK2API_TEMP_FILE_TTL_SEC:-172800}"
+      GROK2API_RETENTION_BATCH_SIZE: "${GROK2API_RETENTION_BATCH_SIZE:-200}"
+      GROK2API_METRICS_MAX_ROWS: "${GROK2API_METRICS_MAX_ROWS:-200000}"
     volumes:
       - ./data:/app/data
     cpus: "${GROK2API_PRODUCER_CPUS:-0.10}"
@@ -179,10 +205,13 @@ services:
 
   pending-recovery:
     <<: *common-env
-    image: grokcli-2api:server
+    image: "${GROK2API_APP_IMAGE:-grokcli-2api:2026.07.13-round8}"
+    logging: *json-logging
     command: ["python", "registration_producer.py"]
     environment:
       GROK2API_PRODUCER_MODE: pending
+      GROK2API_PIPELINE_V2: "${GROK2API_PIPELINE_V2:-0}"
+      GROK2API_ROUTE_STICKY: "${GROK2API_ROUTE_STICKY:-0}"
       GROK2API_PENDING_RECOVERY: "1"
       GROK2API_PENDING_SSO_DIR: /app/data/pending_sso
       GROK2API_PENDING_MIN_AGE_SEC: "${GROK2API_PENDING_MIN_AGE_SEC:-120}"
@@ -190,6 +219,8 @@ services:
       GROK2API_PENDING_RETRY_BASE_SEC: "${GROK2API_PENDING_RETRY_BASE_SEC:-120}"
       GROK2API_PENDING_RETRY_MAX_SEC: "${GROK2API_PENDING_RETRY_MAX_SEC:-3600}"
       GROK2API_RUYIPAGE_APPROVERS: http://ruyipage-approver:8765,http://ruyipage-approver-2:8765
+      GROK2API_ROUTE1_PROXY: http://grok-mihomo:7890
+      GROK2API_ROUTE2_PROXY: http://grok-mihomo-2:7890
       GROK2API_PROXY: http://grok-mihomo:7890
       HTTP_PROXY: http://grok-mihomo:7890
       HTTPS_PROXY: http://grok-mihomo:7890
@@ -214,16 +245,18 @@ services:
       retries: 3
       start_period: 5m
 
-  # Optional mint worker for pipeline v2. Keep profile off until GROK2API_PIPELINE_V2=1.
+  # Optional pair of mint workers. The profile is inert until explicitly selected.
   registration-mint-worker:
     <<: *common-env
     profiles: ["pipeline-v2"]
-    image: grokcli-2api:server
+    image: "${GROK2API_APP_IMAGE:-grokcli-2api:2026.07.13-round8}"
+    logging: *json-logging
     command: ["python", "registration_producer.py"]
     environment:
       GROK2API_PRODUCER_MODE: mint
-      GROK2API_PIPELINE_V2: "${GROK2API_PIPELINE_V2:-0}"
-      GROK2API_ROUTE_STICKY: "${GROK2API_ROUTE_STICKY:-0}"
+      GROK2API_MINT_WORKER_ID: mint-1
+      GROK2API_PIPELINE_V2: "${GROK2API_PIPELINE_V2:-1}"
+      GROK2API_ROUTE_STICKY: "${GROK2API_ROUTE_STICKY:-1}"
       GROK2API_PARALLEL_TOKEN_POLL: "${GROK2API_PARALLEL_TOKEN_POLL:-0}"
       GROK2API_COOKIE_MODE: "${GROK2API_COOKIE_MODE:-sso_only}"
       GROK2API_COOKIE_EXPERIMENT_PERCENT: "${GROK2API_COOKIE_EXPERIMENT_PERCENT:-0}"
@@ -232,6 +265,8 @@ services:
       GROK2API_COOKIE_BUNDLE_DIR: /app/data/cookie_bundles
       GROK2API_PENDING_SSO_DIR: /app/data/pending_sso
       GROK2API_RUYIPAGE_APPROVERS: http://ruyipage-approver:8765,http://ruyipage-approver-2:8765
+      GROK2API_ROUTE1_PROXY: http://grok-mihomo:7890
+      GROK2API_ROUTE2_PROXY: http://grok-mihomo-2:7890
       GROK2API_PROXY: http://grok-mihomo:7890
       HTTP_PROXY: http://grok-mihomo:7890
       HTTPS_PROXY: http://grok-mihomo:7890
@@ -261,13 +296,26 @@ services:
 
   registration-mint-worker-2:
     <<: *common-env
-    image: grokcli-2api:server
     profiles: ["pipeline-v2"]
-    command: ["python", "-c", "from registration_controller import RegistrationController; RegistrationController(worker_id='mint-2').run_forever()"]
+    image: "${GROK2API_APP_IMAGE:-grokcli-2api:2026.07.13-round8}"
+    logging: *json-logging
+    command: ["python", "registration_producer.py"]
     environment:
-      GROK2API_PIPELINE_V2: "1"
+      GROK2API_PRODUCER_MODE: mint
+      GROK2API_MINT_WORKER_ID: mint-2
+      GROK2API_PIPELINE_V2: "${GROK2API_PIPELINE_V2:-1}"
+      GROK2API_ROUTE_STICKY: "${GROK2API_ROUTE_STICKY:-1}"
+      GROK2API_PARALLEL_TOKEN_POLL: "${GROK2API_PARALLEL_TOKEN_POLL:-0}"
+      GROK2API_COOKIE_MODE: "${GROK2API_COOKIE_MODE:-sso_only}"
+      GROK2API_COOKIE_EXPERIMENT_PERCENT: "${GROK2API_COOKIE_EXPERIMENT_PERCENT:-0}"
+      GROK2API_REGISTRATION_QUEUE_DB: /app/data/registration_queue.db
+      GROK2API_REGISTRATION_METRICS_DB: /app/data/registration_metrics.db
+      GROK2API_COOKIE_BUNDLE_DIR: /app/data/cookie_bundles
+      GROK2API_PENDING_SSO_DIR: /app/data/pending_sso
       GROK2API_PRODUCER_HEARTBEAT: /tmp/producer-heartbeat
       GROK2API_RUYIPAGE_APPROVERS: http://ruyipage-approver:8765,http://ruyipage-approver-2:8765
+      GROK2API_ROUTE1_PROXY: http://grok-mihomo:7890
+      GROK2API_ROUTE2_PROXY: http://grok-mihomo-2:7890
       GROK2API_PROXY: http://grok-mihomo-2:7890
       HTTP_PROXY: http://grok-mihomo-2:7890
       HTTPS_PROXY: http://grok-mihomo-2:7890
@@ -277,6 +325,12 @@ services:
     cpus: "0.05"
     mem_limit: "96m"
     depends_on:
+      grok-mihomo:
+        condition: service_healthy
+      grok-mihomo-2:
+        condition: service_healthy
+      grokcli-2api:
+        condition: service_healthy
       ruyipage-approver:
         condition: service_healthy
       ruyipage-approver-2:

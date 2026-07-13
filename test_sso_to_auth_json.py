@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import sso_to_auth_json as sso_import
@@ -135,6 +136,50 @@ class ApproverPoolTests(unittest.TestCase):
 
         self.assertTrue(result["rate_limited"])
         self.assertEqual(called, ["http://a:8765/approve"])
+
+    def test_rate_limit_starts_new_device_flow_after_lease_aware_wait(self) -> None:
+        class _Cookies:
+            def set(self, *_args, **_kwargs):
+                return None
+
+        class _Session:
+            cookies = _Cookies()
+
+            def get(self, *_args, **_kwargs):
+                return SimpleNamespace(url="https://accounts.x.ai/")
+
+        waits: list[dict] = []
+
+        def fake_wait(_seconds, **kwargs):
+            waits.append(kwargs)
+            local = kwargs.get("local_cancel")
+            return bool(local is not None and local.is_set())
+
+        device = {
+            "device_code": "device",
+            "user_code": "CODE",
+            "interval": 1,
+            "expires_in": 30,
+        }
+        with patch.object(
+            sso_import, "requests", SimpleNamespace(Session=_Session)
+        ), patch.object(
+            sso_import, "request_device_code", return_value=device
+        ) as request_code, patch.object(
+            sso_import,
+            "browser_approve_device",
+            side_effect=(
+                {"ok": False, "rate_limited": True},
+                {"ok": False, "denied": True},
+            ),
+        ) as approve, patch.object(sso_import, "_cancel_aware_wait", side_effect=fake_wait):
+            result = sso_import.sso_to_token("sso", parallel_poll=False)
+
+        self.assertIsNone(result)
+        self.assertEqual(request_code.call_count, 2)
+        self.assertEqual(approve.call_count, 2)
+        self.assertEqual(len(waits), 1)
+        self.assertNotIn("local_cancel", waits[0])
 
     def test_busy_sidecar_is_skipped_without_global_serialisation(self) -> None:
         called: list[str] = []

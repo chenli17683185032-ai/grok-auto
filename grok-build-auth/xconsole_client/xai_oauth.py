@@ -883,15 +883,10 @@ def main() -> None:
         cliproxyapi_disabled=args.cliproxyapi_disabled,
     )
     print("xAI OAuth login successful")
-    if result.email:
-        print(f"email: {result.email}")
-    print(f"access_token: {result.access_token[:24]}...")
-    if result.refresh_token:
-        print(f"refresh_token: {result.refresh_token[:24]}...")
-    if result.path:
-        print(f"saved: {result.path}")
-    if result.cliproxyapi_path:
-        print(f"cliproxyapi_auth: {result.cliproxyapi_path}")
+    print(f"access_token_present: {bool(result.access_token)}")
+    print(f"refresh_token_present: {bool(result.refresh_token)}")
+    print(f"saved: {bool(result.path)}")
+    print(f"cliproxyapi_auth_saved: {bool(result.cliproxyapi_path)}")
 
 
 if __name__ == "__main__":

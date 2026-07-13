@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 python:3.12-bookworm
+FROM --platform=linux/amd64 python:3.12.11-bookworm
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl xz-utils libgtk-3-0 libdbus-glib-1-2 libx11-xcb1 \

@@ -1,47 +1,205 @@
-# Linux 服务器部署
+# Linux 服务器部署与回滚
 
-该部署由三个容器组成：API、单实例无头 Firefox 审批器、持续注册调度器。调度器始终通过 API 发起任务，因此 `concurrency` 限制覆盖创建邮箱、注册、审批、换取 Token 和导入账号池的完整生命周期。
+本手册对应 `docker-compose.server.yml`。推荐生产模式为 Pipeline v2：注册完成 SSO 后写入持久化 SQLite 队列，两台 Mint Worker 分别使用两条固定代理 Route 和两台 ruyiPage Sidecar；Access Token、额度等待、失败确认和临时文件清理由后台维护任务处理。
 
-## 启动
+## 1. 拓扑与资源
+
+资源上限按 Compose 声明统一计算：
+
+| 模式 | 服务数 | CPU 上限 | 内存上限 |
+|---|---:|---:|---:|
+| 默认模式 | 7 | 2.45 CPU | 4144 MiB |
+| Pipeline v2 | 9 | 2.55 CPU | 4336 MiB |
+
+统一运维口径：默认 `7 services / 2.45 CPU / 4144 MiB`；Pipeline v2 `9 services / 2.55 CPU / 4336 MiB`。
+
+默认模式的 7 个服务：两台 mihomo、API、两台 ruyiPage、Producer、Pending Recovery。Pipeline v2 再增加 `registration-mint-worker` 和 `registration-mint-worker-2`。
+
+明细：
+
+| 服务 | CPU | 内存 |
+|---|---:|---:|
+| grok-mihomo x2 | 0.15 x2 | 192 MiB x2 |
+| grokcli-2api | 0.40 | 768 MiB |
+| ruyipage-approver x2 | 0.80 x2 | 1400 MiB x2 |
+| registration-producer | 0.10 | 96 MiB |
+| pending-recovery | 0.05 | 96 MiB |
+| registration-mint-worker x2（仅 v2） | 0.05 x2 | 96 MiB x2 |
+
+两台 Sidecar 各自串行审批，因此 Pipeline v2 的稳定注册并发上限默认设为 `2`。提高 API 或 Producer 并发但不增加独立 Sidecar/Route，不会提高审批吞吐。资源可以小幅超额，但应持续观察 `MemAvailable`、容器 OOM、代理限流和最终可用账号/小时。
+
+## 2. 必要配置
+
+创建服务器专用环境文件，权限必须为 `0600`：
 
 ```bash
 cp .env.example .env
-# 填写管理员密码、MoeMail、YesCaptcha、代理等密钥；不要提交 .env
-docker compose -f docker-compose.server.yml config -q
-docker compose -f docker-compose.server.yml up -d --build
-docker compose -f docker-compose.server.yml ps
+chmod 600 .env
 ```
 
-至少配置：
+至少设置以下变量，不要把值写进日志、命令历史、提交或运维手册：
 
 ```env
-GROK2API_ADMIN_PASSWORD=<strong-random-password>
+GROK2API_ADMIN_PASSWORD=<secret>
 GROK2API_MOEMAIL_API_KEY=<secret>
-GROK2API_MOEMAIL_BASE_URL=https://...
-GROK2API_MOEMAIL_DOMAIN=example.com
+GROK2API_MOEMAIL_BASE_URL=https://mail.example.invalid
+GROK2API_MOEMAIL_DOMAIN=mail.example.invalid
 GROK2API_YESCAPTCHA_KEY=<secret>
-GROK2API_XAI_PROXY=http://user:pass@proxy.example:port
 GROK2API_REQUIRE_API_KEY=1
+
+# Pipeline v2 必须同时开启
+GROK2API_PIPELINE_V2=1
+GROK2API_ROUTE_STICKY=1
+
+GROK2API_APP_IMAGE=grokcli-2api:2026.07.13-round8
+GROK2API_RUYIPAGE_IMAGE=ruyipage-headless:2026.07.13-round8
+GROK2API_MIHOMO_IMAGE=metacubex/mihomo:v1.19.28
+GROK2API_MIHOMO_CONFIG_DIR=/opt/new-api/mihomo
+GROK2API_MIHOMO2_CONFIG_DIR=/opt/grokcli-2api/mihomo-2
+GROK2API_NEW_API_NETWORK=app_yunbay-network
 ```
 
-默认只监听 `127.0.0.1:3000`，供同机反代或 New API 使用。如确需监听公网，显式设置 `GROK2API_BIND_ADDRESS=0.0.0.0`，并同时配置防火墙、HTTPS 反代和 API Key。
+禁止使用 `latest`。回滚依赖版本化镜像 Tag；更严格的环境可将三项镜像配置为 Digest。
 
-## 资源和并发
+默认监听 `127.0.0.1:3000`，供同机 New API 或反向代理使用。如需公网监听，显式设置 `GROK2API_BIND_ADDRESS=0.0.0.0`，并同时启用 HTTPS、防火墙和 API Key。
 
-默认资源上限合计约为 `2.35 CPU / 2.4 GiB RAM`：
+## 3. 上线顺序
 
-- API：`1 CPU / 768 MiB`
-- ruyiPage：`1.25 CPU / 1.5 GiB`，`768 MiB /dev/shm`
-- 调度器：`0.1 CPU / 96 MiB`
-
-要给整机保留约 40% 空闲资源，应满足：
+固定顺序为：
 
 ```text
-容器 CPU 上限总和 <= 主机逻辑 CPU × 0.60
-容器内存上限总和 <= 主机可用内存 × 0.60
+preflight -> backup -> up -> smoke -> observe -> rollback（需要时）
 ```
 
-无头审批器当前串行处理浏览器任务，因此默认生产并发为 `1`。在没有完成持续压测前，不建议把注册并发调高。若主机至少 8 vCPU / 16 GiB，且代理与 xAI 没有限流，可先逐级验证 `2`，不要直接跳到更高值：
+Preflight 会检查必需变量是否存在、两套 mihomo 配置、外部 Docker Network、CPU/内存/磁盘、挂载权限、Compose、镜像架构和版本。外部 Network 不存在时会在 timeout 内创建；在任何数据库迁移前，脚本通过 SQLite backup API 将 Queue/Metrics DB 做一致性备份，并将部署环境一起保存到 `data/backups/preflight-<UTC timestamp>/`。脚本不打印变量值。
+
+```bash
+./scripts/server_preflight.sh
+```
+
+启动完整 Pipeline v2，两个 Mint Worker 必须同时启动：
+
+```bash
+docker compose --env-file .env -f docker-compose.server.yml \
+  --profile pipeline-v2 up -d --build \
+  grok-mihomo grok-mihomo-2 grokcli-2api \
+  ruyipage-approver ruyipage-approver-2 \
+  registration-producer pending-recovery \
+  registration-mint-worker registration-mint-worker-2
+```
+
+执行有界 Smoke：
+
+```bash
+GROK2API_SMOKE_TIMEOUT_SEC=360 ./scripts/smoke_server.sh
+```
+
+Smoke 验证 API readiness、无 Key 拒绝、Admin 登录、双 Sidecar、双代理 Route、隔离合成 Queue handoff、双 Mint claim 和 lease recovery。所有循环和网络调用都有 timeout。
+
+上线后至少观察 2 小时：
+
+```bash
+docker compose --env-file .env -f docker-compose.server.yml \
+  --profile pipeline-v2 ps
+
+docker compose --env-file .env -f docker-compose.server.yml \
+  --profile pipeline-v2 logs -f --tail=200 \
+  grokcli-2api registration-producer pending-recovery \
+  registration-mint-worker registration-mint-worker-2 \
+  ruyipage-approver ruyipage-approver-2
+```
+
+## 4. 停止与回滚
+
+只停止新账号 Mint，不中断 API：
+
+```bash
+docker compose --env-file .env -f docker-compose.server.yml \
+  --profile pipeline-v2 stop \
+  registration-mint-worker registration-mint-worker-2
+```
+
+停止持续注册但保留 API 与 Pending Recovery：
+
+```bash
+docker compose --env-file .env -f docker-compose.server.yml \
+  --profile pipeline-v2 stop registration-producer \
+  registration-mint-worker registration-mint-worker-2
+```
+
+完整回滚使用 Preflight 生成的备份目录。脚本会同时停止两个 Mint Worker，恢复版本化环境/必要 DB，随后对所有读取环境变量的 API、Producer、Sidecar、Proxy 和两个 Mint Worker执行 `--force-recreate`，最后运行有界 Smoke：
+
+```bash
+GROK2API_ROLLBACK_BACKUP_DIR=/opt/grokcli-2api/data/backups/preflight-YYYYMMDDTHHMMSSZ \
+  ./scripts/rollback_server.sh
+```
+
+也可显式指定旧镜像：
+
+```bash
+GROK2API_ROLLBACK_APP_IMAGE=grokcli-2api:<old-tag> \
+GROK2API_ROLLBACK_RUYIPAGE_IMAGE=ruyipage-headless:<old-tag> \
+GROK2API_ROLLBACK_MIHOMO_IMAGE=metacubex/mihomo:<old-tag> \
+GROK2API_ROLLBACK_BACKUP_DIR=<backup-dir> \
+  ./scripts/rollback_server.sh
+```
+
+## 5. 账号生命周期
+
+### Token 自动续期
+
+约 5 小时的 Access Token 有效期不是账号寿命。`token_maintainer.py` 会提前进入刷新窗口并使用 Refresh Token 自动续期。刷新失败采用多周期确认：
+
+- 第一次明确 `invalid_grant` 进入 `refresh_pending_confirmation`，不是终局。
+- 未过期 Access Token 继续服务。
+- 网络、超时和 5xx 不增加明确失败次数。
+- 至少 3 次明确失败，并至少一次发生在 Access Token 到期后，才进入 `refresh_terminal`。
+- 后续成功会清空整轮失败证据。
+
+### 1M / 24 小时额度
+
+账号每天约 1M Token 用完后进入 `quota_waiting`，不应立即删除或反复轮询。到达 Reset 后通过真实 `/v1/responses` 小请求验证：
+
+- 恢复成功立即回到 active。
+- 普通 429、网络、超时和 5xx 只延后 Probe，不计失败证据。
+- 只有明确 `free_usage_exhausted` 才增加确认。
+- 至少 3 次确认、跨至少 2 个维护周期并经过 Grace，才进入 `quota_reset_failed`。
+- 清理账号仍默认 Dry Run，并且还有 Producer 二次观察窗口。
+
+### 手工禁用与凭据封禁
+
+`manual_disabled`、`credential_suspended`、Quota 和 model block 相互独立。Quota 恢复不会重新启用手工禁用账号；手工启用会原子清除 credential suspend，但不会擅自清除 Quota 或 model block。
+
+## 6. Retention 与数据路径
+
+主 `registration-producer` 是 Retention Owner，并使用跨进程文件锁避免重复维护：
+
+```text
+Terminal Queue Job: 7 days
+Metrics Event: 7 days + 200000 row cap
+Cookie Bundle / Pending SSO: 48 hours
+Single cleanup batch: 200 rows/files
+```
+
+Active Job 引用的 SSO/Cookie 文件永远不被 Sweeper 删除。每轮结果写入 `data/retention_status.json`，只记录时间和数量，不记录秘密。
+
+关键路径：
+
+```text
+/app/data/auth.json                         0600
+/app/data/settings.json                     0600
+/app/data/keys.json                         0600
+/app/data/registration_queue.db             0600
+/app/data/registration_metrics.db           0600
+/app/data/pending_sso/                       0700
+/app/data/cookie_bundles/                    0700
+```
+
+所有 9 个 Compose 服务均使用 Docker `json-file` 日志轮转：`max-size=10m`、`max-file=3`。
+
+## 7. 并发调整
+
+初始生产值：
 
 ```env
 GROK2API_PRODUCER_BATCH_SIZE=2
@@ -49,106 +207,4 @@ GROK2API_PRODUCER_CONCURRENCY=2
 GROK2API_REG_MAX_CONCURRENCY=2
 ```
 
-每次只改变一个参数，并观察至少 2 小时的成功率、`rate_limited`、内存峰值和 sidecar 队列等待时间。由于单 sidecar 内部有全局锁，提高 API 注册并发不会提高审批吞吐；若要真正提高并发，需要按副本分片审批器，而不是去掉锁。
-
-## 24 小时运行与续期
-
-`registration-producer` 完成一批后等待默认 45 秒再启动下一批；失败会以 30 秒起步指数退避，最大 15 分钟，避免持续撞击上游。三个容器均设置 `restart: unless-stopped` 和健康检查。
-
-默认仅 `pending-recovery` 容器消费 legacy pending（`GROK2API_PENDING_RECOVERY=1`），主 `registration-producer` 必须为 0，避免双消费者。
-
-注册已经取得 SSO、但 Device Flow 暂时失败时，API 会以 `0600` 权限将恢复材料保存在 `data/pending_sso/`。生产器在新批次之前串行恢复这些文件：默认跳过 120 秒内仍可能由 API 处理的文件，每轮最多恢复 2 个；成功导入账号池后才删除，失败则保留并按 2 分钟起步、最长 1 小时指数退避。日志会过滤 SSO/JWT，不会输出恢复材料。相关开关：
-
-```env
-GROK2API_PENDING_RECOVERY=0
-GROK2API_PENDING_MIN_AGE_SEC=120
-GROK2API_PENDING_MAX_PER_CYCLE=2
-GROK2API_PENDING_RETRY_BASE_SEC=120
-GROK2API_PENDING_RETRY_MAX_SEC=3600
-```
-
-`registration-producer` 必须与 API 共享 `./data:/app/data`；服务器 Compose 已包含该挂载。不要把 `data/pending_sso` 放入日志、备份公开目录或镜像层。
-
-Access Token 的约 5 小时有效期不是账号寿命。API 内置 `token_maintainer.py`，默认提前 15 分钟进入刷新窗口，并使用 `refresh_token` 自动续期；服务器 compose 强制启用维护器。可通过 `/health` 中的 `token_maintainer.running` 和管理后台维护状态确认它在运行。
-
-停止持续生产但保持 API：
-
-```bash
-docker compose -f docker-compose.server.yml stop registration-producer
-```
-
-## 资源口径（2026-07-13 更新）
-
-用户已接受 Pipeline v2 小幅超额，不再要求压回 2.40 CPU。
-
-| 模式 | 约计 CPU | 约计内存 |
-|------|----------|----------|
-| 默认 Compose | 2.45 CPU | 4144 MiB |
-| Pipeline v2（含 mint worker 0.05） | 2.50 CPU | 4240 MiB |
-
-API 默认 `cpus=0.40`；两 ruyiPage 各 0.80；两 mihomo 各 0.15；producer 0.10；pending-recovery 0.05；mint worker 0.05。
-
-## Pipeline v2 灰度（注册性能优化）
-
-完整计划见：
-
-```text
-docs/GROK_REGISTRATION_SPEED_OPTIMIZATION_PLAN.md
-```
-
-默认 **全部关闭**，行为与旧版一致。按阶段打开（每次只开一档，观察 ≥2 小时）：
-
-```env
-# 阶段0：仅观测（默认 metrics on）
-GROK2API_METRICS_ENABLED=1
-
-# 阶段1：Route Affinity
-GROK2API_ROUTE_STICKY=1
-
-# 阶段2：持久化 Mint 队列（需启动 mint worker profile）
-GROK2API_PIPELINE_V2=1
-
-# 阶段3：Cookie Bundle 实验 10%
-GROK2API_COOKIE_MODE=sso_only
-GROK2API_COOKIE_EXPERIMENT_PERCENT=10
-
-# 阶段4：仅 approver-2 Warm Browser
-GROK2API_RUYIPAGE_WARM_BROWSER=1
-
-# 阶段5：并行 Token Poll
-GROK2API_PARALLEL_TOKEN_POLL=1
-
-# 阶段6：自适应调度（最后）
-GROK2API_ADAPTIVE_SCHEDULER=1
-```
-
-启动 mint worker（仅 pipeline v2）：
-
-```bash
-docker compose -f docker-compose.server.yml --profile pipeline-v2 up -d registration-mint-worker
-```
-
-资源硬预算目标合计 ≤ 2.40 CPU。API 默认 cpus 已对齐为 `0.40`（可用 `GROK2API_API_CPUS` 覆盖）。
-
-Flag 回滚：将上述开关全部置 0 / `sso_only` 并停止 mint worker：
-
-```bash
-docker compose -f docker-compose.server.yml --profile pipeline-v2 stop registration-mint-worker
-```
-
-数据路径（权限 0600/0700）：
-
-```text
-/app/data/registration_queue.db
-/app/data/registration_metrics.db
-/app/data/cookie_bundles/
-/app/data/pending_sso/
-```
-
-**验收 KPI 不是启动注册数**，而是最终可用账号 / 小时与 6 小时 refresh 存活。未完成主验收 Agent 检查前不要全量打开 Cookie Bundle 或 Adaptive。
-
-查看关键日志：
-
-```bash
-docker compose -f docker-compose.server.yml logs -f --tail=200 grokcli-2api registration-producer ruyipage-approver
-```
+每次只改变一个变量，并观察最终可用账号/小时、Mint Queue oldest age、`rate_limited`、refresh 存活率、内存峰值和两个 Sidecar 的利用率。不要以“启动注册数”作为吞吐指标。

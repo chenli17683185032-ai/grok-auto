@@ -23,6 +23,13 @@ class AuthError(Exception):
     """Raised when credentials cannot be loaded or are expired."""
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 @dataclass
 class GrokCredentials:
     token: str
@@ -33,6 +40,13 @@ class GrokCredentials:
     team_id: str | None = None
     refresh_token: str | None = None
     oidc_client_id: str | None = None
+    refresh_status: str | None = None
+    refresh_failure_count: int = 0
+    refresh_first_failed_at: float | None = None
+    refresh_last_failed_at: float | None = None
+    refresh_next_retry_at: float | None = None
+    refresh_terminal_at: float | None = None
+    refresh_confirmed_after_expiry: bool = False
 
     @property
     def expired(self) -> bool:
@@ -92,7 +106,27 @@ def _entry_to_creds(name: str, entry: dict[str, Any]) -> GrokCredentials:
         if isinstance(entry.get("refresh_token"), str)
         else None,
         oidc_client_id=entry.get("oidc_client_id"),
+        refresh_status=entry.get("refresh_status"),
+        refresh_failure_count=_safe_int(entry.get("refresh_failure_count")),
+        refresh_first_failed_at=entry.get("refresh_first_failed_at"),
+        refresh_last_failed_at=entry.get("refresh_last_failed_at"),
+        refresh_next_retry_at=entry.get("refresh_next_retry_at"),
+        refresh_terminal_at=entry.get("refresh_terminal_at"),
+        refresh_confirmed_after_expiry=bool(
+            entry.get("refresh_confirmed_after_expiry")
+        ),
     )
+
+
+def _refresh_retry_deferred(entry: dict[str, Any], *, now: float | None = None) -> bool:
+    if entry.get("refresh_status") != "refresh_pending_confirmation":
+        return False
+    try:
+        return (time.time() if now is None else now) < float(
+            entry.get("refresh_next_retry_at") or 0
+        )
+    except (TypeError, ValueError):
+        return True
 
 
 def _iter_entries(data: dict[str, Any]) -> list[tuple[str, dict[str, Any], float]]:
@@ -100,13 +134,10 @@ def _iter_entries(data: dict[str, Any]) -> list[tuple[str, dict[str, Any], float
     for key, value in data.items():
         if not isinstance(value, dict):
             continue
-        # A refresh token that the OIDC endpoint has permanently rejected is
-        # an account-wide terminal state.  Do not keep serving requests with
-        # its still-unexpired access token: that only adds latency/failover and
-        # lets a dead account remain in round-robin until the JWT expires.
-        if value.get("refresh_invalid"):
-            # Keep serving while access token is still unexpired; only exclude when
-            # access is gone/expired so a single refresh failure is not fatal.
+        # Only the multi-cycle terminal state is durable.  Legacy
+        # refresh_invalid and pending confirmation continue serving a still-live
+        # access token while background maintenance gathers fresh evidence.
+        if value.get("refresh_status") == "refresh_terminal":
             tok = value.get("key") or value.get("access_token") or value.get("token")
             exp = parse_expires_at(value.get("expires_at"), tok if isinstance(tok, str) else None)
             if not tok or (exp is not None and float(exp) <= time.time() + 60):
@@ -177,6 +208,8 @@ def list_live_credentials(
                 and creds.expired
                 and creds.refresh_token
                 and refreshed < max_inline_refresh
+                and entry.get("refresh_status") != "refresh_terminal"
+                and not _refresh_retry_deferred(entry)
             ):
                 # only hard-refresh a tiny number of already-expired entries
                 try:
@@ -220,15 +253,13 @@ def load_credentials(
             "Session token expired. Use device-code login or import a fresh token."
         )
     if creds.expired and creds.refresh_token:
-        try:
-            from oidc_auth import refresh_and_persist
-
-            r = refresh_and_persist(name, entry)
-            creds = _entry_to_creds(r["account_id"], r["entry"])
-        except Exception as e:
-            raise AuthError(
-                f"Token expired and refresh failed: {e}. Re-login or import."
-            ) from e
+        status = str(entry.get("refresh_status") or "")
+        if status == "refresh_terminal":
+            raise AuthError("Token expired and refresh is terminal. Re-login or import.")
+        if _refresh_retry_deferred(entry):
+            raise AuthError("Token expired; refresh retry is scheduled.")
+        # ensure_fresh_entry already attempted the exchange once in this load.
+        raise AuthError("Token expired and refresh failed. Re-login or import.")
     return creds
 
 
@@ -268,13 +299,13 @@ def load_credentials_by_id(account_id: str, path: Path | None = None) -> GrokCre
     creds = _entry_to_creds(account_id, entry)
     if creds.expired:
         if creds.refresh_token:
-            try:
-                from oidc_auth import refresh_and_persist
-
-                r = refresh_and_persist(account_id, entry)
-                return _entry_to_creds(r["account_id"], r["entry"])
-            except Exception as e:
-                raise AuthError(f"Account token expired / refresh failed: {e}") from e
+            status = str(entry.get("refresh_status") or "")
+            if status == "refresh_terminal":
+                raise AuthError("Account token expired; refresh is terminal")
+            if _refresh_retry_deferred(entry):
+                raise AuthError("Account token expired; refresh retry is scheduled")
+            # ensure_fresh_entry already attempted once above.
+            raise AuthError("Account token expired / refresh failed")
         raise AuthError(f"Account token expired: {account_id}")
     return creds
 

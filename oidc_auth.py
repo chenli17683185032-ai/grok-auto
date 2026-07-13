@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 import uuid
@@ -25,6 +26,40 @@ _device_sessions: dict[str, dict[str, Any]] = {}
 # Serialize refresh for same account (avoid parallel refresh_token races)
 _refresh_locks: dict[str, threading.Lock] = {}
 _refresh_locks_guard = threading.Lock()
+
+REFRESH_FAILURES_REQUIRED = max(
+    3, int(os.getenv("GROK2API_REFRESH_FAILURES_REQUIRED", "3"))
+)
+REFRESH_RETRY_BASE_SECONDS = max(
+    0.0, float(os.getenv("GROK2API_REFRESH_RETRY_BASE_SECONDS", "300"))
+)
+REFRESH_RETRY_MAX_SECONDS = max(
+    REFRESH_RETRY_BASE_SECONDS,
+    float(os.getenv("GROK2API_REFRESH_RETRY_MAX_SECONDS", "3600")),
+)
+_REFRESH_FAILURE_KEYS = (
+    "refresh_invalid",
+    "refresh_invalid_at",
+    "refresh_invalid_reason",
+    "refresh_status",
+    "refresh_failure_count",
+    "refresh_first_failed_at",
+    "refresh_last_failed_at",
+    "refresh_next_retry_at",
+    "refresh_terminal_at",
+    "refresh_confirmed_after_expiry",
+    "refresh_failure_reason",
+)
+
+
+def _oidc_client_kwargs(*, timeout: float = 30.0) -> dict[str, Any]:
+    """Use the configured server egress explicitly, never ambient proxy state."""
+    import config
+
+    kwargs: dict[str, Any] = {"timeout": timeout, "trust_env": False}
+    if config.XAI_PROXY:
+        kwargs["proxy"] = config.XAI_PROXY
+    return kwargs
 
 
 def _b64url_json(segment: str) -> dict[str, Any]:
@@ -308,6 +343,88 @@ def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
     )
 
 
+def _clear_refresh_failure_state(entry: dict[str, Any]) -> dict[str, Any]:
+    out = dict(entry)
+    for key in _REFRESH_FAILURE_KEYS:
+        out.pop(key, None)
+    return out
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _migrate_legacy_refresh_state(
+    entry: dict[str, Any], *, now: float
+) -> tuple[dict[str, Any], bool]:
+    """Turn one-shot legacy refresh_invalid into retryable evidence."""
+    if not entry.get("refresh_invalid"):
+        return entry, False
+    out = dict(entry)
+    try:
+        marked_at = float(out.get("refresh_invalid_at") or now)
+    except (TypeError, ValueError):
+        marked_at = now
+    count = max(1, _safe_int(out.get("refresh_failure_count")))
+    out["refresh_status"] = "refresh_pending_confirmation"
+    out["refresh_failure_count"] = count
+    out.setdefault("refresh_first_failed_at", marked_at)
+    out.setdefault("refresh_last_failed_at", marked_at)
+    # Force one fresh maintenance confirmation instead of trusting the legacy
+    # terminal flag.  The next failure still has to pass all modern gates.
+    out["refresh_next_retry_at"] = 0.0
+    out["refresh_failure_reason"] = str(
+        out.get("refresh_invalid_reason") or "legacy refresh invalid"
+    )[:300]
+    out.pop("refresh_invalid", None)
+    out.pop("refresh_invalid_at", None)
+    out.pop("refresh_invalid_reason", None)
+    out.pop("refresh_terminal_at", None)
+    return out, True
+
+
+def _record_definitive_refresh_failure(
+    entry: dict[str, Any], *, reason: str, now: float
+) -> dict[str, Any]:
+    """Record one independent invalid-grant cycle without premature deletion."""
+    out = dict(entry)
+    previous = max(0, _safe_int(out.get("refresh_failure_count")))
+    count = previous + 1
+    token = out.get("key") or out.get("access_token") or out.get("token")
+    exp = parse_expires_at(
+        out.get("expires_at"), token if isinstance(token, str) else None
+    )
+    post_expiry = bool(exp is not None and now >= float(exp))
+    confirmed_after_expiry = bool(
+        out.get("refresh_confirmed_after_expiry") or post_expiry
+    )
+    out.pop("refresh_invalid", None)
+    out.pop("refresh_invalid_at", None)
+    out.pop("refresh_invalid_reason", None)
+    out["refresh_failure_count"] = count
+    out.setdefault("refresh_first_failed_at", now)
+    out["refresh_last_failed_at"] = now
+    out["refresh_failure_reason"] = reason[:300]
+    out["refresh_confirmed_after_expiry"] = confirmed_after_expiry
+    terminal = count >= REFRESH_FAILURES_REQUIRED and confirmed_after_expiry
+    if terminal:
+        out["refresh_status"] = "refresh_terminal"
+        out["refresh_terminal_at"] = now
+        out.pop("refresh_next_retry_at", None)
+    else:
+        delay = min(
+            REFRESH_RETRY_MAX_SECONDS,
+            REFRESH_RETRY_BASE_SECONDS * (2 ** max(0, count - 1)),
+        )
+        out["refresh_status"] = "refresh_pending_confirmation"
+        out["refresh_next_retry_at"] = now + delay
+        out.pop("refresh_terminal_at", None)
+    return out
+
+
 def refresh_access_token(
     entry: dict[str, Any],
     *,
@@ -323,12 +440,6 @@ def refresh_access_token(
     rt = entry.get("refresh_token")
     if not rt:
         raise ValueError("no refresh_token on account")
-    # Permanently bad refresh tokens are marked by a previous cycle so we do
-    # not burn OIDC quota every few minutes on the same dead accounts.
-    if entry.get("refresh_invalid"):
-        raise RefreshRevokedError(
-            str(entry.get("refresh_invalid_reason") or "refresh_token marked invalid")
-        )
     client_id = (
         entry.get("oidc_client_id")
         or GROK_CLI_CLIENT_ID
@@ -342,7 +453,7 @@ def refresh_access_token(
     if client is not None:
         resp = client.post(OIDC_TOKEN_URL, data=form, headers=headers)
     else:
-        with httpx.Client(timeout=30.0) as c:
+        with httpx.Client(**_oidc_client_kwargs()) as c:
             resp = c.post(OIDC_TOKEN_URL, data=form, headers=headers)
     if resp.status_code >= 400:
         body = resp.text[:400]
@@ -418,6 +529,14 @@ def ensure_fresh_entry(
     token = entry.get("key")
     exp = parse_expires_at(entry.get("expires_at"), token if isinstance(token, str) else None)
     now = time.time()
+    if entry.get("refresh_status") == "refresh_terminal":
+        return entry
+    if entry.get("refresh_status") == "refresh_pending_confirmation":
+        try:
+            if now < float(entry.get("refresh_next_retry_at") or 0):
+                return entry
+        except (TypeError, ValueError):
+            return entry
     if exp is not None and exp > now + skew_seconds:
         return entry
     if not entry.get("refresh_token"):
@@ -425,6 +544,15 @@ def ensure_fresh_entry(
     try:
         result = refresh_and_persist(account_id, entry)
         return result["entry"]
+    except RefreshRevokedError as exc:
+        failed = _record_definitive_refresh_failure(
+            entry, reason=str(exc)[:300], now=now
+        )
+        try:
+            upsert_entry(account_id, failed)
+        except Exception:
+            pass
+        return failed
     except Exception:
         return entry
 
@@ -465,8 +593,8 @@ def start_device_authorization(
         or data.get("verification_uri")
         or "https://accounts.x.ai/oauth2/device"
     )
-    interval = int(data.get("interval") or 5)
-    expires_in = int(data.get("expires_in") or 1800)
+    interval = _safe_int(data.get("interval"), 5)
+    expires_in = _safe_int(data.get("expires_in"), 1800)
     started = time.time()
 
     sess = {
@@ -481,11 +609,8 @@ def start_device_authorization(
         "expires_at": started + expires_in,
         "started_at": started,
         "finished_at": None,
-        "message": (
-            f"请在浏览器打开 {verification_url} ，输入设备码 {str(user_code).upper()}"
-        ),
+        "message": "设备授权已启动，等待确认",
         "error": None,
-        "output": json.dumps(data, ensure_ascii=False),
         "account_id": None,
         "email": None,
     }
@@ -499,15 +624,12 @@ def start_device_authorization(
     return {
         "ok": True,
         "session_id": session_id,
-        "user_code": sess["user_code"],
-        "verification_url": verification_url,
         "status": "waiting_user",
-        "message": sess["message"],
+        "message": "设备授权已启动，等待确认",
         "interval": sess["interval"],
         "expires_in": expires_in,
         "capture": True,
         "native_oidc": True,
-        "command": f"OIDC device @ {OIDC_DEVICE_URL}",
     }
 
 
@@ -525,7 +647,7 @@ def _device_poll_worker(session_id: str) -> None:
                 return
             device_code = sess["device_code"]
             client_id = sess["client_id"]
-            interval = int(sess.get("interval") or 5)
+            interval = _safe_int(sess.get("interval"), 5)
 
         form = {
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
@@ -580,11 +702,10 @@ def _device_poll_worker(session_id: str) -> None:
                     sess = _device_sessions.get(session_id)
                     if sess:
                         sess["status"] = "success"
-                        sess["message"] = f"登录成功: {entry.get('email') or account_id}"
+                        sess["message"] = "登录成功"
                         sess["account_id"] = account_id
                         sess["email"] = entry.get("email")
                         sess["finished_at"] = time.time()
-                        sess["output"] = (sess.get("output") or "") + "\n" + body_text[:500]
             except Exception as e:  # noqa: BLE001
                 with _lock:
                     sess = _device_sessions.get(session_id)
@@ -645,20 +766,23 @@ def get_device_session(session_id: str) -> dict[str, Any] | None:
         sess = _device_sessions.get(session_id)
         if not sess:
             return None
+        status = str(sess.get("status") or "unknown")
+        messages = {
+            "waiting_user": "设备授权等待确认",
+            "running": "设备授权处理中",
+            "success": "登录成功",
+            "expired": "设备授权已过期",
+            "error": "设备授权失败",
+        }
         return {
             "session_id": sess["id"],
             "mode": sess.get("mode"),
-            "status": sess.get("status"),
-            "user_code": sess.get("user_code"),
-            "verification_url": sess.get("verification_url"),
-            "message": sess.get("message"),
-            "error": sess.get("error"),
-            "output_tail": (sess.get("output") or "")[-2000:],
+            "status": status,
+            "message": messages.get(status, "设备授权状态未知"),
+            "error": "device_authorization_failed" if status == "error" else None,
             "started_at": sess.get("started_at"),
             "finished_at": sess.get("finished_at"),
-            "account_id": sess.get("account_id"),
-            "email": sess.get("email"),
-            "ok": sess.get("status") in ("running", "waiting_user", "success"),
+            "ok": status in ("running", "waiting_user", "success"),
             "native_oidc": True,
         }
 
@@ -712,6 +836,7 @@ def refresh_all_accounts(
     data = read_auth_map()
     results: list[dict[str, Any]] = []
     candidates: list[tuple[str, dict[str, Any]]] = []
+    migrations: dict[str, dict[str, Any]] = {}
     now = time.time()
     wanted: set[str] | None = None
     if account_ids is not None:
@@ -732,25 +857,53 @@ def refresh_all_accounts(
             continue
         if wanted is not None and aid not in wanted:
             continue
+        entry, migrated = _migrate_legacy_refresh_state(entry, now=now)
+        if migrated:
+            migrations[aid] = entry
         if not entry.get("refresh_token"):
             results.append({"id": aid, "ok": False, "error": "no refresh_token"})
             continue
-        if entry.get("refresh_invalid"):
+        refresh_status = entry.get("refresh_status")
+        if refresh_status == "refresh_terminal":
             results.append(
                 {
                     "id": aid,
                     "ok": False,
                     "skipped": True,
-                    "reason": "refresh_invalid",
-                    "error": str(entry.get("refresh_invalid_reason") or "refresh_token marked invalid")[:200],
+                    "reason": "refresh_terminal",
+                    "error": str(
+                        entry.get("refresh_failure_reason")
+                        or "refresh token terminal after confirmations"
+                    )[:200],
                 }
             )
             continue
+        if refresh_status == "refresh_pending_confirmation":
+            try:
+                next_retry = float(entry.get("refresh_next_retry_at") or 0)
+            except (TypeError, ValueError):
+                next_retry = 0.0
+            if next_retry > now:
+                results.append(
+                    {
+                        "id": aid,
+                        "ok": False,
+                        "skipped": True,
+                        "reason": "refresh_backoff",
+                        "next_retry_at": next_retry,
+                    }
+                )
+                continue
         token = entry.get("key")
         exp = parse_expires_at(
             entry.get("expires_at"), token if isinstance(token, str) else None
         )
-        if only_near_expiry and exp is not None and exp > now + skew_seconds:
+        if (
+            only_near_expiry
+            and refresh_status != "refresh_pending_confirmation"
+            and exp is not None
+            and exp > now + skew_seconds
+        ):
             results.append(
                 {"id": aid, "ok": True, "skipped": True, "reason": "still_valid"}
             )
@@ -787,7 +940,7 @@ def refresh_all_accounts(
         candidates = candidates[:max_accounts]
 
     updates: dict[str, dict[str, Any]] = {}
-    invalid_marks: dict[str, str] = {}
+    lifecycle_marks: dict[str, dict[str, Any]] = {}
     updates_lock = threading.Lock()
     # One shared client per worker thread instead of opening a fresh TCP/TLS
     # session for every account in the batch.
@@ -798,7 +951,7 @@ def refresh_all_accounts(
     def _thread_client() -> httpx.Client:
         client = getattr(_tls, "client", None)
         if client is None or client.is_closed:
-            client = httpx.Client(timeout=30.0)
+            client = httpx.Client(**_oidc_client_kwargs())
             _tls.client = client
             with _clients_lock:
                 _clients.append(client)
@@ -810,11 +963,8 @@ def refresh_all_accounts(
             r = refresh_and_persist(
                 aid, entry, client=_thread_client(), persist=False
             )
-            # Successful refresh clears any previous invalid mark.
-            new_entry = dict(r["entry"])
-            new_entry.pop("refresh_invalid", None)
-            new_entry.pop("refresh_invalid_at", None)
-            new_entry.pop("refresh_invalid_reason", None)
+            # Any successful exchange clears the complete failure cycle.
+            new_entry = _clear_refresh_failure_state(dict(r["entry"]))
             with updates_lock:
                 updates[r["account_id"]] = new_entry
                 # Drop old key if remounted to a different storage id
@@ -828,14 +978,22 @@ def refresh_all_accounts(
             }
         except RefreshRevokedError as e:
             reason = str(e)[:300]
+            failed_entry = _record_definitive_refresh_failure(
+                entry, reason=reason, now=now
+            )
             with updates_lock:
-                invalid_marks[aid] = reason
+                lifecycle_marks[aid] = failed_entry
+            terminal = failed_entry.get("refresh_status") == "refresh_terminal"
             return {
                 "id": aid,
                 "ok": False,
                 "error": reason,
-                "permanent": True,
-                "reason": "refresh_invalid",
+                "permanent": terminal,
+                "reason": failed_entry["refresh_status"],
+                "failure_count": failed_entry["refresh_failure_count"],
+                "confirmed_after_expiry": bool(
+                    failed_entry.get("refresh_confirmed_after_expiry")
+                ),
             }
         except Exception as e:  # noqa: BLE001
             return {"id": aid, "ok": False, "error": str(e)[:300]}
@@ -862,9 +1020,12 @@ def refresh_all_accounts(
                         pass
                 _clients.clear()
 
-    # Single batched write for successful refreshes + permanent invalid marks.
-    if updates or invalid_marks:
+    # Single batched write for successful refreshes + lifecycle evidence.
+    if updates or lifecycle_marks or migrations:
         def _apply(m: dict[str, Any]) -> None:
+            for aid, entry in migrations.items():
+                if aid not in updates and aid not in lifecycle_marks:
+                    m[aid] = entry
             for aid, entry in updates.items():
                 if aid == "__delete__" or not isinstance(entry, dict):
                     continue
@@ -885,15 +1046,9 @@ def refresh_all_accounts(
                     if same_user or same_token:
                         del m[k]
                 m[aid] = entry
-            for aid, reason in invalid_marks.items():
-                cur = m.get(aid)
-                if not isinstance(cur, dict):
-                    continue
-                cur = dict(cur)
-                cur["refresh_invalid"] = True
-                cur["refresh_invalid_at"] = time.time()
-                cur["refresh_invalid_reason"] = reason[:300]
-                m[aid] = cur
+            for aid, marked in lifecycle_marks.items():
+                if isinstance(m.get(aid), dict):
+                    m[aid] = marked
 
         try:
             mutate_auth_map(_apply)
@@ -905,7 +1060,11 @@ def refresh_all_accounts(
                 "refreshed": 0,
                 "deferred": deferred,
                 "attempted": len(candidates),
-                "invalidated": len(invalid_marks),
+                "invalidated": sum(
+                    1
+                    for entry in lifecycle_marks.values()
+                    if entry.get("refresh_status") == "refresh_terminal"
+                ),
             }
 
     out = {
@@ -915,7 +1074,10 @@ def refresh_all_accounts(
         "deferred": deferred,
         "attempted": len(candidates),
         "workers": workers,
-        "invalidated": sum(1 for r in results if r.get("permanent") or r.get("reason") == "refresh_invalid"),
+        "invalidated": sum(1 for r in results if r.get("reason") == "refresh_terminal"),
+        "pending_confirmation": sum(
+            1 for r in results if r.get("reason") == "refresh_pending_confirmation"
+        ),
     }
     if wanted is not None:
         out["selected"] = len(wanted)

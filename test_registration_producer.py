@@ -186,7 +186,10 @@ class RegistrationProducerTests(unittest.TestCase):
                     "id": "invalid",
                     "expired": False,
                     "has_refresh_token": True,
-                    "refresh_invalid": True,
+                    "refresh_status": "refresh_terminal",
+                    "refresh_failure_count": 3,
+                    "refresh_confirmed_after_expiry": True,
+                    "refresh_terminal_at": 100.0,
                 },
                 {"id": "no-refresh", "expired": False, "has_refresh_token": False},
                 {"id": "quota", "expired": False, "has_refresh_token": True},
@@ -220,8 +223,10 @@ class RegistrationProducerTests(unittest.TestCase):
         rows = [
             {
                 "id": "dead",
-                "refresh_invalid": True,
-                "refresh_invalid_at": 100.0,
+                "refresh_status": "refresh_terminal",
+                "refresh_failure_count": 3,
+                "refresh_confirmed_after_expiry": True,
+                "refresh_terminal_at": 100.0,
             }
         ]
         with patch.object(producer, "CLEANUP_ENABLED", True), patch.object(
@@ -254,8 +259,10 @@ class RegistrationProducerTests(unittest.TestCase):
             },
             {
                 "id": "dead",
-                "refresh_invalid": True,
-                "refresh_invalid_at": 1.0,
+                "refresh_status": "refresh_terminal",
+                "refresh_failure_count": 3,
+                "refresh_confirmed_after_expiry": True,
+                "refresh_terminal_at": 1.0,
             },
         ]
         delete_result = {"removed": ["dead"], "removed_count": 1}
@@ -268,7 +275,7 @@ class RegistrationProducerTests(unittest.TestCase):
         ), patch.object(producer, "_request", return_value=delete_result) as request:
             first = producer._cleanup_accounts("token", rows)
             second = producer._cleanup_accounts("token", rows)
-        # quota waiting must never be deleted; only permanent refresh_invalid
+        # Quota waiting must never be deleted; only fully confirmed refresh terminal.
         self.assertEqual(first["ready"], 0)
         self.assertEqual(second["removed"], 1)
         request.assert_called_once_with(
@@ -289,6 +296,31 @@ class RegistrationProducerTests(unittest.TestCase):
             self.assertEqual(producer._registration_domain(), "a.example")
             producer._record_imported(1)
             self.assertEqual(producer._registration_domain(), "b.example")
+
+    def test_corrupt_persisted_counts_fail_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as td, patch.object(
+            producer, "PRODUCER_STATE", Path(td) / "state.json"
+        ), patch.object(producer, "PRODUCER_DOMAINS", ("a.example", "b.example")), patch.object(
+            producer, "DOMAIN_ROTATE_EVERY", 500
+        ):
+            producer.PRODUCER_STATE.write_text(
+                json.dumps({"imported_lifetime": "broken"}), encoding="utf-8"
+            )
+            self.assertEqual(producer._registration_domain(), "a.example")
+            producer._record_imported(1)
+            state = json.loads(producer.PRODUCER_STATE.read_text(encoding="utf-8"))
+            self.assertEqual(state["imported_lifetime"], 1)
+
+        self.assertIsNone(
+            producer._cleanup_reason(
+                {
+                    "refresh_status": "refresh_terminal",
+                    "refresh_failure_count": "broken",
+                    "refresh_confirmed_after_expiry": True,
+                    "refresh_terminal_at": 1.0,
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

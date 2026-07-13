@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from registration_jobs import JobState, RegistrationJob, new_job_id
@@ -146,8 +149,6 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(c2.state, JobState.MINT_RUNNING.value)
 
     def test_failed_does_not_consume_capacity(self) -> None:
-        import os
-
         os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = "2"
         os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = "2"
         try:
@@ -164,6 +165,142 @@ class QueueTests(unittest.TestCase):
         finally:
             os.environ.pop("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT", None)
             os.environ.pop("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT", None)
+
+    def _install_legacy_duplicate_rows(self) -> tuple[RegistrationJob, RegistrationJob]:
+        with closing(sqlite3.connect(self.db)) as conn:
+            with conn:
+                conn.execute("DROP INDEX idx_jobs_session_one_active")
+        survivor = RegistrationJob(
+            job_id="job-active-owner",
+            session_id="legacy-duplicate",
+            route_id="route-1",
+            state=JobState.MINT_RUNNING.value,
+            lease_owner="live-owner",
+            lease_until=time.time() + 300,
+            payload={"owner_value": "keep"},
+            created_at=10,
+            updated_at=10,
+        )
+        recovery = RegistrationJob(
+            job_id="job-recovery-material",
+            session_id="legacy-duplicate",
+            route_id="route-2",
+            state=JobState.MINT_QUEUED.value,
+            sso_ref="/secure/pending/legacy.json",
+            cookie_bundle_path="/secure/cookies/legacy.json",
+            payload={"email": "hash-only", "recovery_value": "merge"},
+            created_at=20,
+            updated_at=20,
+        )
+        self.q.save(survivor)
+        self.q.save(recovery)
+        return survivor, recovery
+
+    def test_existing_duplicate_active_sessions_migrate_before_unique_index(self) -> None:
+        survivor, recovery = self._install_legacy_duplicate_rows()
+        migrated = RegistrationQueue(self.db)
+        rows = [migrated.get(survivor.job_id), migrated.get(recovery.job_id)]
+        active = [j for j in rows if j and j.state not in ("auth_imported", "dead_letter", "failed")]
+        self.assertEqual([j.job_id for j in active], [survivor.job_id])
+        loser = migrated.get(recovery.job_id)
+        assert loser is not None
+        self.assertEqual(loser.state, JobState.FAILED.value)
+        self.assertEqual(loser.error_code, "duplicate_session_migrated")
+        with closing(sqlite3.connect(self.db)) as conn:
+            indexes = {row[1] for row in conn.execute("PRAGMA index_list(jobs)")}
+        self.assertIn("idx_jobs_session_one_active", indexes)
+
+    def test_duplicate_migration_is_idempotent(self) -> None:
+        self._install_legacy_duplicate_rows()
+        RegistrationQueue(self.db)
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = conn.execute(
+                "SELECT job_id,state,error_code,sso_ref,cookie_bundle_path,payload_json "
+                "FROM jobs ORDER BY job_id"
+            ).fetchall()
+        RegistrationQueue(self.db)
+        with closing(sqlite3.connect(self.db)) as conn:
+            after = conn.execute(
+                "SELECT job_id,state,error_code,sso_ref,cookie_bundle_path,payload_json "
+                "FROM jobs ORDER BY job_id"
+            ).fetchall()
+        self.assertEqual(before, after)
+
+    def test_duplicate_migration_preserves_recovery_material(self) -> None:
+        survivor, recovery = self._install_legacy_duplicate_rows()
+        migrated = RegistrationQueue(self.db)
+        kept = migrated.get(survivor.job_id)
+        loser = migrated.get(recovery.job_id)
+        assert kept is not None and loser is not None
+        self.assertEqual(kept.sso_ref, recovery.sso_ref)
+        self.assertEqual(kept.cookie_bundle_path, recovery.cookie_bundle_path)
+        self.assertEqual(kept.payload["owner_value"], "keep")
+        self.assertEqual(kept.payload["recovery_value"], "merge")
+        self.assertEqual(loser.sso_ref, recovery.sso_ref)
+        self.assertEqual(loser.cookie_bundle_path, recovery.cookie_bundle_path)
+
+    def test_duplicate_enqueue_returns_persisted_active_job(self) -> None:
+        original = self._job()
+        persisted = self.q.enqueue(original)
+        duplicate = RegistrationJob(
+            job_id=new_job_id(),
+            session_id=original.session_id,
+            route_id="route-2",
+            state=JobState.MINT_QUEUED.value,
+        )
+        returned = self.q.enqueue(duplicate)
+        self.assertEqual(returned.job_id, persisted.job_id)
+        self.assertIsNone(self.q.get(duplicate.job_id))
+
+    def test_duplicate_enqueue_does_not_return_terminal_history(self) -> None:
+        original = self._job()
+        persisted = self.q.enqueue(original)
+        terminal = RegistrationJob(
+            job_id=new_job_id(),
+            session_id=original.session_id,
+            route_id="route-2",
+            state=JobState.FAILED.value,
+            created_at=time.time() + 100,
+            updated_at=time.time() + 100,
+        )
+        self.q.save(terminal)
+        duplicate = RegistrationJob(
+            job_id=new_job_id(),
+            session_id=original.session_id,
+            route_id="route-2",
+            state=JobState.MINT_QUEUED.value,
+        )
+        returned = self.q.enqueue(duplicate)
+        self.assertEqual(returned.job_id, persisted.job_id)
+        self.assertNotEqual(returned.job_id, terminal.job_id)
+
+    def test_duplicate_enqueue_at_hard_limit_is_idempotent(self) -> None:
+        old_hard = os.environ.get("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT")
+        old_soft = os.environ.get("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT")
+        os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = "1"
+        os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = "1"
+        try:
+            original = self._job()
+            persisted = self.q.enqueue(original)
+            duplicate = RegistrationJob(
+                job_id=new_job_id(),
+                session_id=original.session_id,
+                route_id="route-2",
+                state=JobState.MINT_QUEUED.value,
+            )
+            returned = self.q.enqueue(duplicate)
+            self.assertEqual(returned.job_id, persisted.job_id)
+            with self.assertRaises(RuntimeError):
+                self.q.enqueue(self._job())
+        finally:
+            if old_hard is None:
+                os.environ.pop("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT", None)
+            else:
+                os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = old_hard
+            if old_soft is None:
+                os.environ.pop("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT", None)
+            else:
+                os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = old_soft
 
 
 if __name__ == "__main__":

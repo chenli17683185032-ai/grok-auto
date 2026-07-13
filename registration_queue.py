@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_state_next ON jobs(state, next_run_at, lease_until);
 CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+"""
+
+_ACTIVE_SESSION_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_session_one_active
   ON jobs(session_id)
   WHERE state NOT IN ('auth_imported','dead_letter','failed');
@@ -109,7 +112,17 @@ class RegistrationQueue:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=60000")
+        self._chmod_storage_files()
         return conn
+
+    def _chmod_storage_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                path = Path(f"{self.db_path}{suffix}")
+                if path.exists() and not path.is_symlink():
+                    os.chmod(path, 0o600)
+            except OSError:
+                pass
 
     def _init_db(self) -> None:
         with self._lock:
@@ -125,12 +138,131 @@ class RegistrationQueue:
                     conn.execute(
                         "ALTER TABLE jobs ADD COLUMN lease_generation INTEGER DEFAULT 0"
                     )
+                conn.execute("BEGIN IMMEDIATE")
+                self._migrate_duplicate_active_sessions(conn)
+                conn.execute(_ACTIVE_SESSION_INDEX)
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
             finally:
                 conn.close()
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
+            self._chmod_storage_files()
+
+    @staticmethod
+    def _decode_payload(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(str(raw))
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+
+    def _migrate_duplicate_active_sessions(self, conn: sqlite3.Connection) -> None:
+        """Fence duplicate legacy rows before installing the active-session index."""
+        placeholders = ",".join("?" * len(_CAPACITY_TERMINAL))
+        duplicate_sessions = conn.execute(
+            f"""
+            SELECT session_id
+            FROM jobs
+            WHERE state NOT IN ({placeholders})
+            GROUP BY session_id
+            HAVING COUNT(*) > 1
+            ORDER BY session_id
+            """,
+            _CAPACITY_TERMINAL,
+        ).fetchall()
+        now = time.time()
+        for duplicate in duplicate_sessions:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM jobs
+                WHERE session_id=? AND state NOT IN ({placeholders})
+                """,
+                (str(duplicate["session_id"]), *_CAPACITY_TERMINAL),
+            ).fetchall()
+
+            def rank(row: sqlite3.Row) -> tuple[int, int, float, str]:
+                payload = self._decode_payload(row["payload_json"])
+                valid_owner = int(
+                    bool(str(row["lease_owner"] or ""))
+                    and float(row["lease_until"] or 0) > now
+                )
+                recovery = sum(
+                    (
+                        bool(str(row["sso_ref"] or "")),
+                        bool(str(row["cookie_bundle_path"] or "")),
+                        bool(payload),
+                    )
+                )
+                return (
+                    -valid_owner,
+                    -recovery,
+                    -float(row["updated_at"] or 0),
+                    str(row["job_id"]),
+                )
+
+            ranked = sorted(rows, key=rank)
+            if len(ranked) < 2:
+                continue
+            survivor = ranked[0]
+            survivor_payload = self._decode_payload(survivor["payload_json"])
+            survivor_sso = str(survivor["sso_ref"] or "")
+            survivor_bundle = str(survivor["cookie_bundle_path"] or "")
+            recovery_rows: list[dict[str, Any]] = []
+            for row in ranked[1:]:
+                row_payload = self._decode_payload(row["payload_json"])
+                if not survivor_sso and row["sso_ref"]:
+                    survivor_sso = str(row["sso_ref"])
+                if not survivor_bundle and row["cookie_bundle_path"]:
+                    survivor_bundle = str(row["cookie_bundle_path"])
+                for key, value in row_payload.items():
+                    survivor_payload.setdefault(key, value)
+                recovery_rows.append(
+                    {
+                        "job_id": str(row["job_id"]),
+                        "has_sso_ref": bool(row["sso_ref"]),
+                        "has_cookie_bundle": bool(row["cookie_bundle_path"]),
+                        "payload_keys": sorted(row_payload),
+                    }
+                )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET state=?, error_class=?, error_code=?, lease_owner='',
+                        lease_until=0, updated_at=?
+                    WHERE job_id=?
+                    """,
+                    (
+                        JobState.FAILED.value,
+                        "permanent",
+                        "duplicate_session_migrated",
+                        now,
+                        str(row["job_id"]),
+                    ),
+                )
+            if recovery_rows:
+                survivor_payload["duplicate_session_recovery"] = recovery_rows
+            conn.execute(
+                """
+                UPDATE jobs
+                SET sso_ref=?, cookie_bundle_path=?, payload_json=?, updated_at=?
+                WHERE job_id=?
+                """,
+                (
+                    survivor_sso,
+                    survivor_bundle,
+                    json.dumps(survivor_payload, ensure_ascii=False),
+                    max(now, float(survivor["updated_at"] or 0)),
+                    str(survivor["job_id"]),
+                ),
+            )
 
     def count_open(self) -> int:
         with self._lock:
@@ -181,13 +313,25 @@ class RegistrationQueue:
         )
 
     def enqueue(self, job: RegistrationJob) -> RegistrationJob:
-        """Insert job; hard-limit check is inside the same write transaction."""
+        """Idempotently insert one active job; capacity is checked transactionally."""
         job.updated_at = time.time()
         params = self._row_params(job)
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                existing_row = conn.execute(
+                    f"""
+                    SELECT * FROM jobs
+                    WHERE session_id=? AND state NOT IN ({','.join('?' * len(_CAPACITY_TERMINAL))})
+                    ORDER BY updated_at DESC, job_id ASC
+                    LIMIT 1
+                    """,
+                    (job.session_id, *_CAPACITY_TERMINAL),
+                ).fetchone()
+                if existing_row:
+                    conn.execute("COMMIT")
+                    return RegistrationJob.from_row(dict(existing_row))
                 cur = conn.execute(
                     f"SELECT COUNT(*) AS c FROM jobs WHERE state NOT IN ({','.join('?' * len(_CAPACITY_TERMINAL))})",
                     _CAPACITY_TERMINAL,
@@ -211,12 +355,16 @@ class RegistrationQueue:
                     conn.execute("COMMIT")
                 except IntegrityError:
                     conn.execute("ROLLBACK")
-                    existing = None
                     conn2 = self._connect()
                     try:
                         cur = conn2.execute(
-                            "SELECT * FROM jobs WHERE session_id=? ORDER BY created_at DESC LIMIT 1",
-                            (job.session_id,),
+                            f"""
+                            SELECT * FROM jobs
+                            WHERE session_id=? AND state NOT IN ({','.join('?' * len(_CAPACITY_TERMINAL))})
+                            ORDER BY updated_at DESC, job_id ASC
+                            LIMIT 1
+                            """,
+                            (job.session_id, *_CAPACITY_TERMINAL),
                         )
                         row = cur.fetchone()
                         if row:
@@ -232,10 +380,7 @@ class RegistrationQueue:
                 raise
             finally:
                 conn.close()
-            try:
-                os.chmod(self.db_path, 0o600)
-            except OSError:
-                pass
+            self._chmod_storage_files()
         return job
 
     def save(self, job: RegistrationJob, *, require_fence: bool = False) -> bool:
@@ -672,6 +817,64 @@ class RegistrationQueue:
             finally:
                 conn.close()
 
+    def active_material_paths(self) -> set[str]:
+        """Return active SSO/cookie references without opening their contents."""
+        placeholders = ",".join("?" * len(_CAPACITY_TERMINAL))
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT sso_ref, cookie_bundle_path
+                    FROM jobs
+                    WHERE state NOT IN ({placeholders})
+                    """,
+                    _CAPACITY_TERMINAL,
+                ).fetchall()
+            finally:
+                conn.close()
+        paths: set[str] = set()
+        for row in rows:
+            for key in ("sso_ref", "cookie_bundle_path"):
+                value = str(row[key] or "").strip()
+                if value:
+                    paths.add(value)
+        return paths
+
+    def purge_terminal(self, *, before: float, limit: int = 200) -> int:
+        """Delete a bounded oldest batch of terminal jobs."""
+        batch = max(0, int(limit))
+        if batch == 0:
+            return 0
+        placeholders = ",".join("?" * len(_CAPACITY_TERMINAL))
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    f"""
+                    DELETE FROM jobs
+                    WHERE job_id IN (
+                      SELECT job_id FROM jobs
+                      WHERE state IN ({placeholders}) AND updated_at < ?
+                      ORDER BY updated_at ASC, job_id ASC
+                      LIMIT ?
+                    )
+                    """,
+                    (*_CAPACITY_TERMINAL, float(before), batch),
+                )
+                deleted = max(0, int(cur.rowcount or 0))
+                conn.execute("COMMIT")
+                return deleted
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                conn.close()
+
     def oldest_open_age_sec(self, now: float | None = None) -> float | None:
         current = time.time() if now is None else now
         with self._lock:
@@ -734,9 +937,16 @@ def dual_write_pending(
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
     try:
         os.chmod(path, 0o600)
+        dir_fd = os.open(str(base), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except OSError:
         pass
     return path

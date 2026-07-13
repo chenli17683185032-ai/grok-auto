@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from registration_controller import RegistrationController
 from registration_jobs import JobState
@@ -63,6 +66,118 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(job.state, JobState.MINT_QUEUED.value)
         self.assertTrue(job.sso_ref)
         self.assertTrue(Path(job.sso_ref).is_file())
+
+    def test_controller_returns_persisted_job_id(self) -> None:
+        first = self.ctrl.enqueue_after_sso(
+            session_id="gba_idempotent",
+            email="u@example.com",
+            sso="eyJfirst",
+            route_id="route-1",
+            dual_write=False,
+        )
+        second = self.ctrl.enqueue_after_sso(
+            session_id="gba_idempotent",
+            email="u@example.com",
+            sso="eyJsecond",
+            route_id="route-2",
+            dual_write=False,
+        )
+        self.assertEqual(second.job_id, first.job_id)
+        self.assertEqual(second.route_id, first.route_id)
+        self.assertEqual(sum(self.q.list_states().values()), 1)
+
+    def test_two_mint_workers_use_two_routes_and_two_approvers(self) -> None:
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"GROK2API_ROUTE_STICKY": "1"}):
+            first = self.ctrl.enqueue_after_sso(
+                session_id="gba_route_a",
+                email="a@example.com",
+                sso="eyJa",
+                dual_write=False,
+            )
+            second = self.ctrl.enqueue_after_sso(
+                session_id="gba_route_b",
+                email="b@example.com",
+                sso="eyJb",
+                dual_write=False,
+            )
+        self.assertEqual({first.route_id, second.route_id}, {"route-1", "route-2"})
+        registry = reset_registry_for_tests(
+            (
+                Route("route-1", "http://p1", "http://p1", "http://a1", "a1", "m1"),
+                Route("route-2", "http://p2", "http://p2", "http://a2", "a2", "m2"),
+            )
+        )
+        self.assertEqual(
+            {registry.approver_for(first.route_id), registry.approver_for(second.route_id)},
+            {"http://a1", "http://a2"},
+        )
+
+    def _run_with_heartbeat_loss(self):
+        path = dual_write_pending(
+            session_id="gba_lease_loss",
+            email="lease@example.com",
+            sso="eyJlease",
+            pending_dir=self.pending,
+        )
+        self.q.import_pending_json(path, route_id="route-1")
+        claimed = self.q.claim("test-worker")
+        assert claimed is not None
+        actions: list[str] = []
+        imported: list[str] = []
+        heartbeat_calls = 0
+
+        def heartbeat(_job, *, lease_sec=300.0):
+            nonlocal heartbeat_calls
+            heartbeat_calls += 1
+            return heartbeat_calls == 1
+
+        def token_fn(_sso, *, cancel_event=None, lease_guard=None, **_kwargs):
+            actions.append("upstream-1")
+            assert cancel_event is not None
+            self.assertTrue(cancel_event.wait(timeout=2.0))
+            if not cancel_event.is_set() and (lease_guard is None or lease_guard()):
+                actions.append("upstream-2")
+            return {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 3600,
+            }
+
+        def importer(_token, _session_id):
+            imported.append("called")
+            return {"ok": True}
+
+        with mock.patch.object(self.ctrl, "_heartbeat", side_effect=heartbeat), mock.patch.dict(
+            "os.environ", {"GROK2API_LEASE_HEARTBEAT_SEC": "0.05"}
+        ):
+            result = self.ctrl.process_job(
+                claimed,
+                sso_to_token=token_fn,
+                import_entry=importer,
+                require_probe=False,
+            )
+        return result, actions, imported
+
+    def test_heartbeat_loss_cancels_before_next_upstream_action(self) -> None:
+        _result, actions, _imported = self._run_with_heartbeat_loss()
+        self.assertEqual(actions, ["upstream-1"])
+
+    def test_heartbeat_loss_never_imports(self) -> None:
+        _result, _actions, imported = self._run_with_heartbeat_loss()
+        self.assertEqual(imported, [])
+
+    def test_heartbeat_thread_exits(self) -> None:
+        self._run_with_heartbeat_loss()
+        time.sleep(0.05)
+        self.assertFalse(
+            any(
+                thread.is_alive() and thread.name.startswith("lease-hb-")
+                for thread in threading.enumerate()
+            )
+        )
 
     def test_process_job_success_probe_import(self) -> None:
         path = dual_write_pending(

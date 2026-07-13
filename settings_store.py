@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from config import ACCOUNT_MODE, ADMIN_PASSWORD, DATA_DIR, SETTINGS_FILE
+from secure_storage import atomic_write_private_json, ensure_private_dir
 
 _lock = threading.RLock()
 
@@ -28,8 +29,12 @@ _flush_timer: threading.Timer | None = None
 _FLUSH_DELAY_SEC = 1.0
 
 
+class SettingsStoreCorrupt(RuntimeError):
+    """An existing settings file cannot be trusted as application state."""
+
+
 def _ensure() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(DATA_DIR)
 
 
 def _load_disk() -> dict[str, Any]:
@@ -38,9 +43,11 @@ def _load_disk() -> dict[str, Any]:
         return {}
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SettingsStoreCorrupt("existing settings store is unreadable") from exc
+    if not isinstance(data, dict):
+        raise SettingsStoreCorrupt("existing settings store has an invalid root")
+    return data
 
 
 def _load() -> dict[str, Any]:
@@ -54,9 +61,7 @@ def _load() -> dict[str, Any]:
 
 def _write_disk(data: dict[str, Any]) -> None:
     _ensure()
-    tmp = SETTINGS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SETTINGS_FILE)
+    atomic_write_private_json(SETTINGS_FILE, data, pretty=True)
 
 
 def _schedule_flush_locked() -> None:

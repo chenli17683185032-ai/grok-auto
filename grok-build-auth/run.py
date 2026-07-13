@@ -377,9 +377,9 @@ def main():
     for r in _results:
         email = r.get("email") or "?"
         if r.get("cliproxyapi_auth"):
-            print(f"  {email:40s}  BUILD  {r['cliproxyapi_auth']}")
+            print(f"  {email:40s}  BUILD  saved=true")
         elif r.get("sso") and not do_oauth:
-            print(f"  {email:40s}  SSO    {r['sso'][:36]}...")
+            print(f"  {email:40s}  SSO    obtained=true")
         elif r.get("sso") and r.get("error"):
             print(f"  {email:40s}  SSO-ok OAuth-FAIL: {r.get('error')}")
         else:

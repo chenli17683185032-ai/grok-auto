@@ -179,9 +179,8 @@ FORCE_UPSTREAM_STREAM = os.getenv("GROK2API_FORCE_STREAM", "1") not in (
     "False",
 )
 
-# When True (default): if any managed key exists OR env API_KEY set, require a key.
-# When no keys at all, open access (dev mode) unless REQUIRE_API_KEY=1
-REQUIRE_API_KEY = os.getenv("GROK2API_REQUIRE_API_KEY", "auto")
+# Fail closed by default. Local open access requires an explicit value of 0.
+REQUIRE_API_KEY = os.getenv("GROK2API_REQUIRE_API_KEY", "1")
 
 # Request timeout (seconds) for non-stream collection
 TIMEOUT = float(os.getenv("GROK2API_TIMEOUT", "600"))

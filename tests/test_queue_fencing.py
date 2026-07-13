@@ -23,6 +23,27 @@ def _mp_claim_worker(db: str, name: str, out_q: mp.Queue) -> None:
     out_q.put(ids)
 
 
+def _mp_enqueue_worker(db: str, worker_no: int, count: int, out_q: mp.Queue) -> None:
+    q = RegistrationQueue(db)
+    inserted: list[str] = []
+    for index in range(count):
+        session_id = f"w{worker_no}-job{index}"
+        try:
+            job = q.enqueue(
+                RegistrationJob(
+                    job_id=new_job_id(),
+                    session_id=session_id,
+                    route_id="route-1",
+                    state=JobState.MINT_QUEUED.value,
+                )
+            )
+            inserted.append(job.job_id)
+        except RuntimeError as exc:
+            if "hard limit" not in str(exc):
+                raise
+    out_q.put(inserted)
+
+
 class QueueFencingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -164,6 +185,98 @@ class QueueFencingTests(unittest.TestCase):
         os.environ.pop("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT", None)
         self.assertEqual(len(claimed), n)
         self.assertEqual(len(set(claimed)), n)
+
+    def test_multiprocess_claim_exactly_once_8_processes_1000_jobs(self) -> None:
+        import os
+
+        count = 1000
+        old_hard = os.environ.get("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT")
+        old_soft = os.environ.get("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT")
+        os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = str(count + 10)
+        os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = str(count + 10)
+        db = Path(self.tmp.name) / "mp-1000.db"
+        try:
+            queue = RegistrationQueue(db)
+            for index in range(count):
+                queue.enqueue(
+                    RegistrationJob(
+                        job_id=new_job_id(),
+                        session_id=f"claim-{index}",
+                        route_id="route-1",
+                        state=JobState.MINT_QUEUED.value,
+                    )
+                )
+            context = mp.get_context("spawn")
+            output = context.Queue()
+            processes = [
+                context.Process(
+                    target=_mp_claim_worker,
+                    args=(str(db), f"process-{index}", output),
+                )
+                for index in range(8)
+            ]
+            for process in processes:
+                process.start()
+            claimed: list[str] = []
+            for _ in processes:
+                claimed.extend(output.get(timeout=90))
+            for process in processes:
+                process.join(timeout=90)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+            self.assertEqual(len(claimed), count)
+            self.assertEqual(len(set(claimed)), count)
+        finally:
+            if old_hard is None:
+                os.environ.pop("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT", None)
+            else:
+                os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = old_hard
+            if old_soft is None:
+                os.environ.pop("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT", None)
+            else:
+                os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = old_soft
+
+    def test_concurrent_enqueue_hard_limit_8_processes(self) -> None:
+        import os
+
+        hard_limit = 37
+        old_hard = os.environ.get("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT")
+        old_soft = os.environ.get("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT")
+        os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = str(hard_limit)
+        os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = str(hard_limit)
+        db = Path(self.tmp.name) / "mp-hard-limit.db"
+        try:
+            RegistrationQueue(db)
+            context = mp.get_context("spawn")
+            output = context.Queue()
+            processes = [
+                context.Process(
+                    target=_mp_enqueue_worker,
+                    args=(str(db), index, 25, output),
+                )
+                for index in range(8)
+            ]
+            for process in processes:
+                process.start()
+            inserted: list[str] = []
+            for _ in processes:
+                inserted.extend(output.get(timeout=90))
+            for process in processes:
+                process.join(timeout=90)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 0)
+            self.assertEqual(len(inserted), hard_limit)
+            self.assertEqual(len(set(inserted)), hard_limit)
+            self.assertEqual(RegistrationQueue(db).count_open(), hard_limit)
+        finally:
+            if old_hard is None:
+                os.environ.pop("GROK2API_REGISTRATION_QUEUE_HARD_LIMIT", None)
+            else:
+                os.environ["GROK2API_REGISTRATION_QUEUE_HARD_LIMIT"] = old_hard
+            if old_soft is None:
+                os.environ.pop("GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT", None)
+            else:
+                os.environ["GROK2API_REGISTRATION_QUEUE_SOFT_LIMIT"] = old_soft
 
 
 if __name__ == "__main__":

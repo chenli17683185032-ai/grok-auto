@@ -38,7 +38,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from curl_cffi import requests
@@ -80,6 +80,43 @@ def _open_url(req: urllib.request.Request, *, timeout: float = 15, proxy: str | 
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _lease_cancelled(
+    cancel_event: threading.Event | None = None,
+    lease_guard: Callable[[], bool] | None = None,
+) -> bool:
+    return bool(
+        (cancel_event is not None and cancel_event.is_set())
+        or (lease_guard is not None and not lease_guard())
+    )
+
+
+def _cancel_aware_wait(
+    seconds: float,
+    *,
+    cancel_event: threading.Event | None = None,
+    lease_guard: Callable[[], bool] | None = None,
+    local_cancel: threading.Event | None = None,
+) -> bool:
+    """Wait at most `seconds`; return True as soon as cancellation is observed."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if (
+            _lease_cancelled(cancel_event, lease_guard)
+            or (local_cancel is not None and local_cancel.is_set())
+        ):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # Event.wait wakes immediately for the common external lease-loss path.
+        if cancel_event is not None:
+            cancel_event.wait(timeout=min(0.25, remaining))
+        elif local_cancel is not None:
+            local_cancel.wait(timeout=min(0.25, remaining))
+        else:
+            time.sleep(min(0.25, remaining))
+
+
 def b64url_decode(seg: str) -> bytes:
     seg += "=" * (-len(seg) % 4)
     return base64.urlsafe_b64decode(seg)
@@ -100,7 +137,12 @@ def rfc3339_ns(ts: float | None = None) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S") + ".000000000Z"
 
 
-def request_device_code(*, proxy: str | None = None) -> dict | None:
+def request_device_code(
+    *,
+    proxy: str | None = None,
+    cancel_event: threading.Event | None = None,
+    lease_guard: Callable[[], bool] | None = None,
+) -> dict | None:
     """Request OAuth device code; optional per-call proxy for route sticky."""
     data = urllib.parse.urlencode({"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}).encode()
     req = urllib.request.Request(
@@ -109,9 +151,12 @@ def request_device_code(*, proxy: str | None = None) -> dict | None:
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
+    if _lease_cancelled(cancel_event, lease_guard):
+        return None
     try:
         with _open_url(req, timeout=15, proxy=proxy) as resp:
-            return json.loads(resp.read())
+            result = json.loads(resp.read())
+        return None if _lease_cancelled(cancel_event, lease_guard) else result
     except urllib.error.HTTPError as e:
         try:
             body = e.read().decode()[:200]
@@ -250,6 +295,8 @@ def browser_approve_device(
     cookie_bundle_path: str = "",
     cookie_mode: str = "sso_only",
     extra_cookies: list | None = None,
+    cancel_event: threading.Event | None = None,
+    lease_guard: Callable[[], bool] | None = None,
 ) -> dict | None:
     """Approve one Device Flow on one free sidecar.
 
@@ -287,8 +334,12 @@ def browser_approve_device(
     remaining = list(endpoints)
     deadline = time.monotonic() + lock_wait
     while remaining:
+        if _lease_cancelled(cancel_event, lease_guard):
+            return {"ok": False, "cancelled": True, "error": "lease_cancelled"}
         saw_busy = False
         for endpoint in tuple(remaining):
+            if _lease_cancelled(cancel_event, lease_guard):
+                return {"ok": False, "cancelled": True, "error": "lease_cancelled"}
             lease = _try_lock_approver(endpoint)
             if lease is None:
                 saw_busy = True
@@ -301,8 +352,20 @@ def browser_approve_device(
                     headers={"Content-Type": "application/json"},
                 )
                 try:
+                    if _lease_cancelled(cancel_event, lease_guard):
+                        return {
+                            "ok": False,
+                            "cancelled": True,
+                            "error": "lease_cancelled",
+                        }
                     with urllib.request.urlopen(req, timeout=timeout + 30) as resp:
                         result = json.loads(resp.read())
+                    if _lease_cancelled(cancel_event, lease_guard):
+                        return {
+                            "ok": False,
+                            "cancelled": True,
+                            "error": "lease_cancelled",
+                        }
                     if not isinstance(result, dict):
                         raise ValueError("invalid non-object response")
                 except Exception as e:
@@ -320,7 +383,12 @@ def browser_approve_device(
 
         if sticky or not saw_busy or time.monotonic() >= deadline:
             break
-        time.sleep(min(lock_poll, max(0.0, deadline - time.monotonic())))
+        if _cancel_aware_wait(
+            min(lock_poll, max(0.0, deadline - time.monotonic())),
+            cancel_event=cancel_event,
+            lease_guard=lease_guard,
+        ):
+            return {"ok": False, "cancelled": True, "error": "lease_cancelled"}
 
     if remaining:
         print("  ⏳ 所有 ruyiPage sidecar 忙，等待租约超时")
@@ -339,16 +407,24 @@ def poll_token_cancellable(
     *,
     cancel: threading.Event | None = None,
     proxy: str | None = None,
+    cancel_event: threading.Event | None = None,
+    lease_guard: Callable[[], bool] | None = None,
 ) -> dict | None:
     """Token poll that honours cancel + optional per-call proxy for route sticky."""
     deadline = time.time() + min(expires_in, timeout)
     current_interval = max(1, int(interval or 5))
     while time.time() < deadline:
-        if cancel is not None and cancel.is_set():
+        if _lease_cancelled(cancel_event, lease_guard) or (
+            cancel is not None and cancel.is_set()
+        ):
             print("  ⏹ token poll cancelled")
             return None
-        time.sleep(current_interval)
-        if cancel is not None and cancel.is_set():
+        if _cancel_aware_wait(
+            current_interval,
+            cancel_event=cancel_event,
+            lease_guard=lease_guard,
+            local_cancel=cancel,
+        ):
             return None
         data = urllib.parse.urlencode(
             {
@@ -364,8 +440,11 @@ def poll_token_cancellable(
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         try:
+            if _lease_cancelled(cancel_event, lease_guard):
+                return None
             with _open_url(req, timeout=15, proxy=proxy) as resp:
-                return json.loads(resp.read())
+                result = json.loads(resp.read())
+            return None if _lease_cancelled(cancel_event, lease_guard) else result
         except urllib.error.HTTPError as e:
             try:
                 err = json.loads(e.read())
@@ -400,6 +479,8 @@ def sso_to_token(
     cookie_mode: str = "sso_only",
     parallel_poll: bool | None = None,
     extra_cookies: list | None = None,
+    cancel_event: threading.Event | None = None,
+    lease_guard: Callable[[], bool] | None = None,
 ) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in).
 
@@ -408,6 +489,8 @@ def sso_to_token(
     Proxy is applied per-call (curl_cffi proxies= + urllib ProxyHandler),
     never via mutating process-global env under concurrency.
     """
+    if _lease_cancelled(cancel_event, lease_guard):
+        return None
     sticky = bool(route_id or approver_endpoint)
     if sticky and not approver_endpoint and route_id:
         try:
@@ -432,6 +515,8 @@ def sso_to_token(
     s.cookies.set("sso", sso_cookie, domain=".x.ai")
 
     try:
+        if _lease_cancelled(cancel_event, lease_guard):
+            return None
         r = s.get(
             "https://accounts.x.ai/",
             impersonate="chrome",
@@ -441,16 +526,20 @@ def sso_to_token(
     except Exception as e:
         print(f"  ❌ 网络错误: {type(e).__name__}")
         return None
+    if _lease_cancelled(cancel_event, lease_guard):
+        return None
     if "sign-in" in r.url or "sign-up" in r.url:
         print("  ❌ sso 无效")
         return None
     print("  ✅ sso 有效")
 
     print("  🔑 Device Flow...")
-    dc = request_device_code(proxy=proxy)
+    dc = request_device_code(
+        proxy=proxy, cancel_event=cancel_event, lease_guard=lease_guard
+    )
     if not dc:
         return None
-    print(f"  📋 user_code: {dc.get('user_code')}")
+    print("  Device code issued")
 
     use_parallel = (
         parallel_poll
@@ -469,6 +558,8 @@ def sso_to_token(
             dc.get("expires_in", 1800),
             cancel=cancel,
             proxy=proxy,
+            cancel_event=cancel_event,
+            lease_guard=lease_guard,
         )
         poll_holder["done"] = True
 
@@ -488,7 +579,12 @@ def sso_to_token(
             cookie_bundle_path=cookie_bundle_path,
             cookie_mode=cookie_mode,
             extra_cookies=extra_cookies,
+            cancel_event=cancel_event,
+            lease_guard=lease_guard,
         )
+        if _lease_cancelled(cancel_event, lease_guard):
+            cancel.set()
+            return None
         if browser_result is not None:
             if not browser_result.get("ok"):
                 # Cancel parallel poll on structured failure
@@ -500,7 +596,12 @@ def sso_to_token(
                 if browser_result.get("rate_limited") and _attempt < 3:
                     delay = (30, 60, 120)[_attempt]
                     print(f"  ⏳ Device Flow 限流，{delay}s 后申请新 Device Code 重试")
-                    time.sleep(delay)
+                    if _cancel_aware_wait(
+                        delay,
+                        cancel_event=cancel_event,
+                        lease_guard=lease_guard,
+                    ):
+                        return None
                     return sso_to_token(
                         sso_cookie,
                         _attempt + 1,
@@ -510,6 +611,9 @@ def sso_to_token(
                         cookie_bundle_path=cookie_bundle_path,
                         cookie_mode=cookie_mode,
                         parallel_poll=use_parallel,
+                        extra_cookies=extra_cookies,
+                        cancel_event=cancel_event,
+                        lease_guard=lease_guard,
                     )
                 return None
             print("  ✅ ruyiPage 无头浏览器授权确认")
@@ -522,12 +626,18 @@ def sso_to_token(
                 print("  ❌ sticky route approver unavailable")
                 return None
             try:
+                if _lease_cancelled(cancel_event, lease_guard):
+                    cancel.set()
+                    return None
                 s.get(
                     dc["verification_uri_complete"],
                     impersonate="chrome",
                     timeout=15,
                     **session_proxy_kwargs,
                 )
+                if _lease_cancelled(cancel_event, lease_guard):
+                    cancel.set()
+                    return None
                 r = s.post(
                     f"{OIDC_ISSUER}/oauth2/device/verify",
                     data={"user_code": dc["user_code"]},
@@ -537,6 +647,9 @@ def sso_to_token(
                     allow_redirects=True,
                     **session_proxy_kwargs,
                 )
+                if _lease_cancelled(cancel_event, lease_guard):
+                    cancel.set()
+                    return None
                 if "consent" not in r.url:
                     print("  ❌ verify 失败")
                     cancel.set()
@@ -555,6 +668,9 @@ def sso_to_token(
                     allow_redirects=True,
                     **session_proxy_kwargs,
                 )
+                if _lease_cancelled(cancel_event, lease_guard):
+                    cancel.set()
+                    return None
                 if "done" not in r.url:
                     print("  ❌ approve 失败")
                     cancel.set()
@@ -577,6 +693,9 @@ def sso_to_token(
                     dc.get("expires_in", 1800),
                     timeout=30,
                     proxy=proxy,
+                    cancel=cancel,
+                    cancel_event=cancel_event,
+                    lease_guard=lease_guard,
                 )
         else:
             token = poll_token_cancellable(
@@ -584,7 +703,12 @@ def sso_to_token(
                 dc.get("interval", 5),
                 dc.get("expires_in", 1800),
                 proxy=proxy,
+                cancel=cancel,
+                cancel_event=cancel_event,
+                lease_guard=lease_guard,
             )
+        if _lease_cancelled(cancel_event, lease_guard):
+            return None
         if not token:
             return None
         print(

@@ -281,12 +281,10 @@ async def admin_status(request: Request):
     # Counts only — full account list belongs on /accounts and /dashboard.
     pool = account_pool.pool_summary(include_accounts=False)
     creds_ok = False
-    creds_email = None
     try:
         # Never OIDC-refresh on a frequent status poll.
-        c = account_pool.acquire(auto_refresh=False)
+        account_pool.acquire(auto_refresh=False)
         creds_ok = True
-        creds_email = c.email
     except AuthError:
         pass
 
@@ -323,7 +321,6 @@ async def admin_status(request: Request):
         "require_api_key_mode": REQUIRE_API_KEY,
         "api_base": api_base,
         "credentials_ok": creds_ok,
-        "credentials_email": creds_email,
         "account_mode": get_account_mode(),
         "accounts": account,
         "pool": {
