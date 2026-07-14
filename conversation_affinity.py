@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -210,12 +211,10 @@ def conversation_fingerprint(
 
     pck = (prompt_cache_key or "").strip()
     if pck:
+        # A client-provided cache key is already the stable multi-turn identity.
+        # Folding the message root back in makes partial-history clients change
+        # accounts across turns and destroys upstream prefix-cache locality.
         parts.append(f"pck:{pck}")
-        # Cache key alone is enough for multi-turn stickiness; still fold root
-        # when present so different chats reusing a generic key don't collide.
-        root = _conversation_root(messages)
-        if root:
-            parts.append(f"root:{root}")
         return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
     u = (user or "").strip()
@@ -233,11 +232,43 @@ def conversation_fingerprint(
     return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
+# Claude Code and agent relays commonly rewrite these system lines every turn.
+_VOLATILE_SYSTEM_LINE = re.compile(
+    r"(?i)^("
+    r"current\s+date|today'?s\s+date|date\s*:|time\s*:|"
+    r"cwd\s*:|working\s+directory|present\s+working\s+directory|"
+    r"git\s+status|git\s+branch|branch\s*:|"
+    r"model\s*:|session\s*id\s*:|"
+    r"\d{4}-\d{2}-\d{2}([t\s]\d{2}:\d{2})?"
+    r")"
+)
+
+
+def _stable_system_salt(text: str) -> str:
+    """Return a short identity salt after removing volatile system lines."""
+    if not text:
+        return ""
+    keep: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line or _VOLATILE_SYSTEM_LINE.search(line):
+            continue
+        if line.startswith("/") and " " not in line[:4]:
+            continue
+        keep.append(line[:160])
+        if len(keep) >= 24:
+            break
+    joined = "\n".join(keep)
+    if not joined:
+        head = re.sub(r"\s+", " ", text).strip()[:240]
+        if not head:
+            return ""
+        return hashlib.sha256(head.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
 def _conversation_root(messages: list[Any] | None) -> str:
-    """
-    Root identity of a chat: system prompt(s) + first user message.
-    Later assistant/tool turns do not change the root → affinity holds.
-    """
+    """Build a stable fallback identity from first user plus system salt."""
     if not messages:
         return ""
     system_parts: list[str] = []
@@ -250,16 +281,18 @@ def _conversation_root(messages: list[Any] | None) -> str:
         elif role_l == "user" and content and first_user is None:
             first_user = content[:2000]
             break
-    if first_user is None and not system_parts:
-        # tool-only / truncated history: use first two messages as weak root
-        # so multi-turn tool rounds still tend to stick
-        chunks: list[str] = []
-        for m in messages[:3]:
-            role, content = _msg_role_content(m)
-            if content or role:
-                chunks.append(f"{role}:{content[:800]}")
-        return "prefix:" + "\n".join(chunks)
-    return "sys:" + "\n".join(system_parts) + "\nuser:" + (first_user or "")
+    sys_salt = _stable_system_salt("\n".join(system_parts))
+    if first_user is not None:
+        return f"user:{first_user}|sys:{sys_salt}" if sys_salt else f"user:{first_user}"
+    if system_parts:
+        return f"sys:{sys_salt or _stable_system_salt(system_parts[0])}"
+    # Tool-only or truncated history: retain a weak deterministic fallback.
+    chunks: list[str] = []
+    for m in messages[:3]:
+        role, content = _msg_role_content(m)
+        if content or role:
+            chunks.append(f"{role}:{content[:800]}")
+    return "prefix:" + "\n".join(chunks)
 
 
 def _purge_locked(now: float | None = None) -> None:
@@ -523,4 +556,27 @@ def extract_prompt_cache_key(req: Any) -> str | None:
             got = _take(extra.get(key))
             if got:
                 return got
+    return None
+
+
+def extract_prompt_cache_key_from_headers(headers: Any) -> str | None:
+    """Read an optional stable prompt-cache key from common relay headers."""
+    if headers is None:
+        return None
+    try:
+        get = headers.get
+    except Exception:
+        return None
+    for name in (
+        "x-prompt-cache-key",
+        "x-openai-prompt-cache-key",
+        "x-grok2api-prompt-cache-key",
+        "x-cache-key",
+    ):
+        value = get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in ("null", "none", "undefined"):
+            return text[:240]
     return None

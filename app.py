@@ -17,6 +17,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -55,7 +56,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.47"
+APP_VERSION = "1.9.47-cache1"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -137,6 +138,19 @@ async def _close_http_client() -> None:
         await _http_client.aclose()
     _http_client = None
     _http_client_loop = None
+
+
+async def _warm_upstream_client() -> None:
+    """Warm the shared proxy/TLS connection on the serving worker event loop."""
+    base = (UPSTREAM_BASE or "").rstrip("/")
+    if not base:
+        return
+    try:
+        client = await get_http_client()
+        await client.head(base, timeout=httpx.Timeout(7.0, connect=6.0))
+        print("  upstream warmup: ready", flush=True)
+    except Exception as exc:  # best-effort; startup must remain available
+        print(f"  upstream warmup: skipped ({type(exc).__name__})", flush=True)
 
 
 def _on_startup() -> None:
@@ -347,7 +361,7 @@ app = FastAPI(
         "session tokens. High-concurrency multi-worker with Redis + PostgreSQL."
     ),
     version=APP_VERSION,
-    on_startup=[_on_startup],
+    on_startup=[_on_startup, _warm_upstream_client],
     on_shutdown=[_on_shutdown],
 )
 
@@ -587,6 +601,16 @@ def _normalize_function_tool(t: dict[str, Any]) -> dict[str, Any] | None:
     return {"type": "function", "function": fn}
 
 
+def _tool_sort_key(tool: dict[str, Any]) -> str:
+    """Stable tool name used to preserve upstream prompt-prefix locality."""
+    if not isinstance(tool, dict):
+        return ""
+    fn = tool.get("function")
+    if isinstance(fn, dict) and fn.get("name"):
+        return str(fn.get("name") or "").lower()
+    return str(tool.get("name") or "").lower()
+
+
 def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
     """
     Accept OpenAI Chat Completions tool shape and built-in tool types.
@@ -631,6 +655,7 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
         norm = _normalize_function_tool(t)
         if norm is not None:
             out.append(norm)
+    out.sort(key=_tool_sort_key)
     return out or None
 
 
@@ -751,6 +776,9 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     _sanitize_upstream_body(body, model=model)
     # Secondary relays (newapi/sub2api) rely on final stream usage for billing.
     _ensure_stream_include_usage(body)
+    # Canonicalize formatting before optional compaction so repeated turns
+    # produce the same upstream prompt prefix and can reuse Grok's auto-cache.
+    _stabilize_upstream_prompt_body(body)
     # Long Claude Code tool loops → huge bodies; compact past tool results.
     _apply_history_compact(body)
     return body
@@ -917,6 +945,285 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
         body.pop("parallel_tool_calls", None)
 
 
+def _canonicalize_json_value(value: Any) -> Any:
+    """Recursively sort object keys for deterministic request serialization."""
+    if isinstance(value, dict):
+        return {
+            key: _canonicalize_json_value(value[key])
+            for key in sorted(value.keys(), key=str)
+        }
+    if isinstance(value, list):
+        return [_canonicalize_json_value(item) for item in value]
+    return value
+
+
+def _canonical_json_text(raw: Any) -> str | None:
+    """Return compact, key-sorted JSON for object/array tool arguments."""
+    if raw is None:
+        return None
+    if isinstance(raw, (dict, list)):
+        parsed = raw
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if not text or text[0] not in "{[":
+            return None
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, (dict, list)):
+            return None
+    else:
+        return None
+    try:
+        return json.dumps(
+            _canonicalize_json_value(parsed),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _stabilize_tool_parameters(params: Any) -> dict[str, Any]:
+    base = _ensure_tool_parameters(params)
+    canonical = _canonicalize_json_value(base)
+    return canonical if isinstance(canonical, dict) else base
+
+
+def _stabilize_tool_calls(tool_calls: Any) -> list[Any] | None:
+    """Canonicalize history tool calls without changing their order."""
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return tool_calls if isinstance(tool_calls, list) else None
+    out: list[Any] = []
+    for raw in tool_calls:
+        if not isinstance(raw, dict):
+            out.append(raw)
+            continue
+        item = dict(raw)
+        for drop in ("index", "extra_content", "thought_signature"):
+            item.pop(drop, None)
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            fn_out = dict(fn)
+            args = fn_out.get("arguments")
+            canonical = _canonical_json_text(args)
+            if canonical is not None:
+                fn_out["arguments"] = canonical
+            elif args is None:
+                fn_out["arguments"] = "{}"
+            elif not isinstance(args, str):
+                fn_out["arguments"] = str(args)
+            item["function"] = fn_out
+        ordered: dict[str, Any] = {}
+        if item.get("id") is not None:
+            ordered["id"] = item.get("id")
+        ordered["type"] = item.get("type") or "function"
+        if "function" in item:
+            ordered["function"] = item["function"]
+        for key, value in item.items():
+            if key not in ordered:
+                ordered[key] = value
+        out.append(ordered)
+    return out
+
+
+def _stabilize_text_content(text: str, *, role: str) -> str:
+    """Normalize system line endings while preserving user/tool whitespace."""
+    if not isinstance(text, str):
+        return str(text or "")
+    if role != "system":
+        return text
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    had_trailing_newline = normalized.endswith("\n")
+    normalized = normalized.rstrip("\n").rstrip()
+    if had_trailing_newline:
+        return normalized + "\n" if normalized else ""
+    return normalized
+
+
+def _stabilize_message_for_cache(message: Any) -> Any:
+    """Normalize one history message into a deterministic OpenAI shape."""
+    if not isinstance(message, dict):
+        return message
+    role = (message.get("role") or "").strip() or "user"
+    out: dict[str, Any] = {"role": role}
+    if message.get("name") not in (None, ""):
+        out["name"] = message.get("name")
+    if message.get("tool_call_id") not in (None, ""):
+        out["tool_call_id"] = message.get("tool_call_id")
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        out["tool_calls"] = _stabilize_tool_calls(tool_calls)
+
+    function_call = message.get("function_call")
+    if isinstance(function_call, dict) and function_call.get("name"):
+        function_out: dict[str, Any] = {"name": function_call.get("name")}
+        arguments = function_call.get("arguments")
+        canonical = _canonical_json_text(arguments)
+        if canonical is not None:
+            function_out["arguments"] = canonical
+        elif arguments is not None:
+            function_out["arguments"] = (
+                arguments if isinstance(arguments, str) else str(arguments)
+            )
+        else:
+            function_out["arguments"] = "{}"
+        out["function_call"] = function_out
+
+    content = message.get("content")
+    if content is None:
+        if out.get("tool_calls") or out.get("function_call"):
+            out["content"] = None
+        else:
+            out["content"] = ""
+    elif isinstance(content, str):
+        out["content"] = _stabilize_text_content(content, role=role)
+    elif isinstance(content, list):
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, str):
+                if part:
+                    parts.append({"type": "text", "text": part})
+                continue
+            if not isinstance(part, dict):
+                parts.append(part)
+                continue
+            item = dict(part)
+            part_type = (item.get("type") or "text").lower()
+            if part_type in ("text", "input_text", "output_text"):
+                if item.get("text") is not None:
+                    parts.append({"type": "text", "text": str(item.get("text") or "")})
+            else:
+                parts.append(item)
+        if not parts:
+            out["content"] = ""
+        elif all(
+            isinstance(part, dict) and part.get("type") == "text"
+            for part in parts
+        ):
+            joined = "\n".join(str(part.get("text") or "") for part in parts)
+            out["content"] = _stabilize_text_content(joined, role=role)
+        else:
+            out["content"] = parts
+    elif isinstance(content, dict):
+        if content.get("type") in ("text", "input_text") and "text" in content:
+            out["content"] = _stabilize_text_content(
+                str(content.get("text") or ""), role=role
+            )
+        else:
+            canonical = _canonical_json_text(content)
+            out["content"] = canonical if canonical is not None else content
+    else:
+        out["content"] = content
+
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        out["reasoning_content"] = reasoning
+    return out
+
+
+def _stabilize_upstream_prompt_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Make semantically identical tools/messages byte-stable for auto-cache."""
+    if not isinstance(body, dict):
+        return {"messages_stabilized": 0, "tools_stabilized": 0}
+    stats = {
+        "messages_stabilized": 0,
+        "tools_stabilized": 0,
+        "tool_args_canonicalized": 0,
+    }
+
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        cleaned: list[Any] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            normalized = _normalize_function_tool(tool)
+            if normalized is None:
+                continue
+            fn = normalized.get("function")
+            if isinstance(fn, dict):
+                fn = dict(fn)
+                fn["parameters"] = _stabilize_tool_parameters(fn.get("parameters"))
+                if fn.get("description") in (None, ""):
+                    fn.pop("description", None)
+                ordered_fn: dict[str, Any] = {"name": fn.get("name")}
+                if "description" in fn:
+                    ordered_fn["description"] = fn["description"]
+                ordered_fn["parameters"] = (
+                    fn.get("parameters") or _empty_tool_parameters()
+                )
+                for key, value in fn.items():
+                    if key not in ordered_fn:
+                        ordered_fn[key] = value
+                normalized = {"type": "function", "function": ordered_fn}
+            cleaned.append(normalized)
+        cleaned.sort(key=_tool_sort_key)
+        body["tools"] = cleaned
+        stats["tools_stabilized"] = len(cleaned)
+
+    functions = body.get("functions")
+    if isinstance(functions, list) and functions:
+        fixed: list[Any] = []
+        for function in functions:
+            if not isinstance(function, dict) or not function.get("name"):
+                continue
+            fn = dict(function)
+            params = (
+                fn.get("parameters")
+                if fn.get("parameters") is not None
+                else fn.get("input_schema")
+            )
+            fn["parameters"] = _stabilize_tool_parameters(params)
+            fn.pop("input_schema", None)
+            if fn.get("description") in (None, ""):
+                fn.pop("description", None)
+            ordered: dict[str, Any] = {"name": fn.get("name")}
+            if "description" in fn:
+                ordered["description"] = fn["description"]
+            ordered["parameters"] = fn.get("parameters") or _empty_tool_parameters()
+            for key, value in fn.items():
+                if key not in ordered:
+                    ordered[key] = value
+            fixed.append(ordered)
+        fixed.sort(key=lambda item: str(item.get("name") or "").lower())
+        body["functions"] = fixed
+
+    messages = body.get("messages")
+    if isinstance(messages, list) and messages:
+        stable_messages: list[Any] = []
+        for message in messages:
+            stable = _stabilize_message_for_cache(message)
+            if isinstance(stable, dict) and isinstance(stable.get("tool_calls"), list):
+                stats["tool_args_canonicalized"] += len(stable["tool_calls"])
+            stable_messages.append(stable)
+            stats["messages_stabilized"] += 1
+        body["messages"] = stable_messages
+
+    body.pop("metadata", None)
+    # A short, non-reversible structural fingerprint helps verify that the
+    # cache-critical system/tools prefix remains stable without logging text.
+    prefix_basis = {
+        "model": body.get("model"),
+        "tools": body.get("tools"),
+        "functions": body.get("functions"),
+        "messages": (body.get("messages") or [])[:2],
+    }
+    try:
+        prefix_bytes = json.dumps(
+            _canonicalize_json_value(prefix_basis),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        stats["prefix_hash"] = hashlib.sha256(prefix_bytes).hexdigest()[:16]
+    except (TypeError, ValueError):
+        stats["prefix_hash"] = ""
+    body["_prompt_stabilize"] = stats
+    return stats
+
+
 def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
     """Ask upstream for usage on the final SSE chunk when streaming."""
     if not body.get("stream"):
@@ -936,6 +1243,7 @@ def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
         return body
     out = dict(body)
     out.pop("_history_compact", None)
+    out.pop("_prompt_stabilize", None)
     return out
 
 
@@ -961,6 +1269,53 @@ def _history_compact_headers(body: dict[str, Any]) -> dict[str, str]:
     if stats.get("tool_rounds") is not None:
         hdr["X-Grok2API-History-Tool-Rounds"] = str(stats.get("tool_rounds"))
     return hdr
+
+
+def _prompt_stabilize_headers(body: dict[str, Any]) -> dict[str, str]:
+    """Expose only counts/hash needed to verify prompt-cache preparation."""
+    stats = body.get("_prompt_stabilize") if isinstance(body, dict) else None
+    if not isinstance(stats, dict):
+        return {"X-Grok2API-Prompt-Stable": "0"}
+    headers = {
+        "X-Grok2API-Prompt-Stable": "1",
+        "X-Grok2API-Prompt-Stable-Messages": str(
+            stats.get("messages_stabilized") or 0
+        ),
+        "X-Grok2API-Prompt-Stable-Tools": str(stats.get("tools_stabilized") or 0),
+    }
+    if stats.get("prefix_hash"):
+        headers["X-Grok2API-Prompt-Prefix"] = str(stats["prefix_hash"])
+    return headers
+
+
+def _log_prompt_stability(
+    body: dict[str, Any],
+    *,
+    request_id: str,
+    conversation_fp: str | None,
+) -> None:
+    """Log hashes/counts only; never log prompt or tool content."""
+    enabled = (os.getenv("GROK2API_PROMPT_STABLE_LOG") or "1").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        return
+    stats = body.get("_prompt_stabilize") if isinstance(body, dict) else None
+    if not isinstance(stats, dict):
+        return
+    conv_hash = str(conversation_fp or "-")
+    if conv_hash.startswith("fp:"):
+        conv_hash = conv_hash[3:]
+    print(
+        " ".join(
+            (
+                f"  [prompt] id={request_id[:16]}",
+                f"conv={conv_hash[:12]}",
+                f"prefix={str(stats.get('prefix_hash') or '-')[:16]}",
+                f"messages={int(stats.get('messages_stabilized') or 0)}",
+                f"tools={int(stats.get('tools_stabilized') or 0)}",
+            )
+        ),
+        flush=True,
+    )
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -2561,7 +2916,10 @@ def _is_empty_model_payload(
 
 
 def _resolve_conversation_affinity(
-    req: ChatCompletionRequest, request: Request
+    req: ChatCompletionRequest,
+    request: Request,
+    *,
+    api_key_id: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Returns (fingerprint, preferred_account_id).
@@ -2571,11 +2929,17 @@ def _resolve_conversation_affinity(
     conv_id = conversation_affinity.extract_conversation_id_from_headers(
         request.headers
     ) or conversation_affinity.extract_conversation_id_from_body(req)
-    pck = conversation_affinity.extract_prompt_cache_key(req)
+    pck = (
+        conversation_affinity.extract_prompt_cache_key(req)
+        or conversation_affinity.extract_prompt_cache_key_from_headers(
+            request.headers
+        )
+    )
     fp = conversation_affinity.conversation_fingerprint(
         req.messages,
         user=req.user,
         conversation_id=conv_id,
+        api_key_id=api_key_id,
         prompt_cache_key=pck,
     )
     prefer = conversation_affinity.get_affinity(fp) if fp else None
@@ -2639,7 +3003,10 @@ async def chat_completions(
     key_id = _api_key_id(api_key)
     timing = RequestTiming(protocol="openai", stream=bool(req.stream))
     conv_fp, prefer_account = await asyncio.to_thread(
-        _resolve_conversation_affinity, req, request
+        _resolve_conversation_affinity,
+        req,
+        request,
+        api_key_id=key_id,
     )
     timing.mark_affinity(prefer_account)
     model = resolve_model(req.model)
@@ -2673,8 +3040,16 @@ async def chat_completions(
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     timing.req_id = chat_id.replace("chatcmpl-", "")[:12]
     created = int(time.time())
+    _log_prompt_stability(
+        body,
+        request_id=timing.req_id,
+        conversation_fp=conv_fp,
+    )
 
-    compact_hdr = _history_compact_headers(body)
+    compact_hdr = {
+        **_history_compact_headers(body),
+        **_prompt_stabilize_headers(body),
+    }
     if req.stream:
         return StreamingResponse(
             _stream_proxy_with_failover(

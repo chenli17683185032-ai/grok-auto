@@ -1744,7 +1744,10 @@ def try_acquire_sequence(
             if sticky_ready:
                 first = sticky
                 # Optional backups only from warm live-creds cache. Never
-                # rebuild full pool / full pool-state just for backups.
+                # rebuild the full pool on the hot path when the cache already
+                # has enough candidates. If the cache is cold or incomplete,
+                # fall through to the bounded picker below so a healthy sticky
+                # account does not silently degrade to chain=1.
                 backups: list[GrokCredentials] = []
                 try:
                     if max_attempts is not None:
@@ -1798,7 +1801,13 @@ def try_acquire_sequence(
                                 break
                 except Exception:
                     backups = []
-                return [first] + backups
+                # A partial warm cache is not a safe failover chain. Preserve
+                # the low-latency fast path only when it can satisfy the
+                # configured attempt limit; otherwise the full picker keeps
+                # the sticky account first and fills the remaining slots from
+                # the current live pool.
+                if limit <= 1 or len(backups) >= max(0, limit - 1):
+                    return [first] + backups
 
     mode = get_account_mode()
     # Prefer warm process-local pool-state. Full SELECT of 1k+ rows is the main
@@ -1835,6 +1844,7 @@ def try_acquire_sequence(
     )
     # Over-fetch a bit so cooldowns/blocks inside the window still leave a chain.
     window_n = min(len(pool_order), max(24, limit_target * 12))
+    preferred_pool: list[GrokCredentials] = []
     if prefer_account_id and pool_order:
         # Ensure sticky candidate is considered even if outside the RR window.
         pref = prefer_account_id
@@ -1846,6 +1856,7 @@ def try_acquire_sequence(
                 head.append(c)
             else:
                 rest.append(c)
+        preferred_pool = head
         pool_order = head + rest
     # Round-robin / random only need a rotated window, not whole-pool sort.
     if mode == "random" and len(pool_order) > window_n:
@@ -1886,6 +1897,20 @@ def try_acquire_sequence(
     else:
         # least_used benefits from a larger sample but still not the full 1k+.
         pool_window = pool_order[: min(len(pool_order), max(window_n, 64))]
+
+    # RR/random windowing above may rotate the preferred account outside the
+    # bounded slice even though we moved it to pool_order[0]. Put one matching
+    # candidate back explicitly so final affinity ordering can actually pin it.
+    if preferred_pool:
+        preferred = preferred_pool[0]
+        preferred_id = preferred.auth_key or ""
+        pool_window = [preferred] + [
+            candidate
+            for candidate in pool_window
+            if candidate is not preferred
+            and (candidate.auth_key or "") != preferred_id
+        ]
+        pool_window = pool_window[: max(1, window_n)]
 
     if state_is_partial and pool_window:
         try:
