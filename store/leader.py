@@ -69,7 +69,7 @@ def status() -> dict[str, Any]:
 
 
 def _start_maintainers_if_needed() -> None:
-    """Idempotently start token + model maintainers on the elected leader."""
+    """Idempotently start background maintainers on the elected leader."""
     global _maintainers_started
     with _lock:
         if _maintainers_started:
@@ -89,6 +89,14 @@ def _start_maintainers_if_needed() -> None:
         print("  [leader] model health started", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"  [leader] model health start failed: {e}", flush=True)
+    try:
+        import registration_maintainer
+
+        registration_maintainer.start_background()
+        if registration_maintainer.is_enabled():
+            print("  [leader] registration maintainer started", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [leader] registration maintainer start failed: {e}", flush=True)
 
 
 def _stop_maintainers_if_needed() -> None:
@@ -108,6 +116,12 @@ def _stop_maintainers_if_needed() -> None:
         import model_health
 
         model_health.stop_background()
+    except Exception:
+        pass
+    try:
+        import registration_maintainer
+
+        registration_maintainer.stop_background()
     except Exception:
         pass
     print("  [leader] maintainers stopped (lost leadership)", flush=True)

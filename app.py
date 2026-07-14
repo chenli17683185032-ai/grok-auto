@@ -296,6 +296,19 @@ def _on_startup() -> None:
                 )
         except Exception as e:  # noqa: BLE001
             print(f"  (model health failed: {e})")
+        try:
+            import registration_maintainer
+
+            registration_maintainer.start_background()
+            rm = registration_maintainer.status(light=True)
+            if rm.get("enabled"):
+                print(
+                    "  registration maintainer: enabled "
+                    f"(target={rm.get('target')} batch={rm.get('batch_size')} "
+                    f"rest={rm.get('rest_sec')}s)"
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  (registration maintainer failed: {e})")
     else:
         # Multi-worker: this process lost the first election. store.leader keeps
         # watching and will start maintainers when the lock becomes free.
@@ -2333,6 +2346,9 @@ async def health():
             # light=True avoids rescanning auth.json for min_remaining on every poll
             "token_maintainer": token_maintainer.status(light=True),
             "model_health": __import__("model_health").status(light=True),
+            "registration_maintainer": __import__("registration_maintainer").status(
+                light=True
+            ),
             "conversation_affinity": conversation_affinity.status(),
             "registration": reg,
             "store": store_info,
