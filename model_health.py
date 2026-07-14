@@ -115,7 +115,15 @@ _ACCOUNT_BLOCK_RE = re.compile(
 )
 
 _SHARED_EGRESS_RE = re.compile(
-    r"model\s+.+?\s+is\s+not\s+available\s+in\s+your\s+region",
+    r"("
+    r"model\s+.+?\s+is\s+not\s+available\s+in\s+your\s+region|"
+    r"unexpected_eof_while_reading|"
+    r"all\s+connection\s+attempts\s+failed|"
+    r"proxyerror|connecterror|"
+    r"connection\s+reset\s+by\s+peer|"
+    r"temporary\s+failure\s+in\s+name\s+resolution|"
+    r"name\s+or\s+service\s+not\s+known"
+    r")",
     re.IGNORECASE,
 )
 
