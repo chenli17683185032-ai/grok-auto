@@ -9,6 +9,9 @@ data
 *.log
 .env
 .env.*
+mihomo
+mihomo.old.*
+.private-staging
 register
 vendors
 **/.pytest_cache
