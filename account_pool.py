@@ -1115,7 +1115,7 @@ def report_failure(
     try:
         from model_health import is_shared_egress_error
 
-        if is_shared_egress_error(error):
+        if is_shared_egress_error(error, status_code):
             return {
                 "action": "shared_egress_error",
                 "account_id": account_id,

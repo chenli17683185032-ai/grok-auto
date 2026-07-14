@@ -128,9 +128,16 @@ _SHARED_EGRESS_RE = re.compile(
 )
 
 
-def is_shared_egress_error(error: str | None) -> bool:
+def is_shared_egress_error(
+    error: str | None, status_code: int | None = None
+) -> bool:
     """True when the failure belongs to the server exit, not one account."""
-    return bool(_SHARED_EGRESS_RE.search((error or "").strip()))
+    text = (error or "").strip()
+    if _SHARED_EGRESS_RE.search(text):
+        return True
+    # Some proxy/read failures surface only as an empty 502/503/504. With no
+    # account-specific evidence, cooling one account only pollutes the pool.
+    return not text and status_code in (502, 503, 504)
 
 
 def is_temporary_usage_error(
