@@ -93,6 +93,9 @@ TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
 | `TURNSTILE_THREAD` | `= REG_CONCURRENCY` | 本地过盾浏览器线程数 |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | 过盾浏览器类型 |
 | `TURNSTILE_PORT` | `5072` | 内联过盾监听端口（容器内 loopback） |
+| `TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC` | `30` | 等待可用浏览器的最长秒数 |
+| `TURNSTILE_POOL_REBUILD_TIMEOUT_SEC` | `60` | 浏览器池关闭或初始化的最长秒数 |
+| `TURNSTILE_BROWSER_CLOSE_TIMEOUT_SEC` | `10` | 单次 context / 失败清理的最长秒数 |
 
 > 2 核小机器建议 `TURNSTILE_THREAD=1~2`；`3` 已较重，`5` 容易把 CPU/内存打满。
 

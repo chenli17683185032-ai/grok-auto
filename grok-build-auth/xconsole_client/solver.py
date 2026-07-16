@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import os
 import time
+from ipaddress import ip_address
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -211,6 +213,31 @@ class YesCaptchaSolver:
             f"(endpoint={self._endpoint})"
         )
 
+    def _uses_loopback_endpoint(self) -> bool:
+        host = (urlparse(self._endpoint).hostname or "").strip().lower()
+        if host == "localhost":
+            return True
+        try:
+            return ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    def _turnstile_task_types(
+        self, *, premium: bool, fallback_non_premium: bool
+    ) -> list[str]:
+        # The bundled loopback solver implements the standard task only.
+        if self._uses_loopback_endpoint():
+            return ["TurnstileTaskProxyless"]
+        if premium:
+            task_types = ["TurnstileTaskProxylessM1"]
+            if fallback_non_premium:
+                task_types.append("TurnstileTaskProxyless")
+            return task_types
+        task_types = ["TurnstileTaskProxyless"]
+        if fallback_non_premium:
+            task_types.append("TurnstileTaskProxylessM1")
+        return task_types
+
     def solve_turnstile(
         self,
         website_url: str,
@@ -235,15 +262,10 @@ class YesCaptchaSolver:
         if not website_url or not website_key:
             raise ValueError("website_url and website_key are required for Turnstile")
 
-        task_types: list[str] = []
-        if premium:
-            task_types.append("TurnstileTaskProxylessM1")
-            if fallback_non_premium:
-                task_types.append("TurnstileTaskProxyless")
-        else:
-            task_types.append("TurnstileTaskProxyless")
-            if fallback_non_premium:
-                task_types.append("TurnstileTaskProxylessM1")
+        task_types = self._turnstile_task_types(
+            premium=premium,
+            fallback_non_premium=fallback_non_premium,
+        )
 
         errors: list[str] = []
         for idx, task_type in enumerate(task_types):
