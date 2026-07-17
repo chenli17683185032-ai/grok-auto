@@ -374,6 +374,7 @@ def status(*, light: bool = False) -> dict[str, Any]:
 
     cluster_running = local_running
     leader_id = None
+    registration_worker_id = None
     try:
         from store.leader import status as leader_status
         from store.redis_client import get_str, key, redis_enabled
@@ -382,6 +383,10 @@ def status(*, light: bool = False) -> dict[str, Any]:
         leader_id = leader.get("leader_id")
         if not local_running and is_enabled() and redis_enabled():
             cluster_running = bool(get_str(key("lock", "maintainer_leader")))
+        if redis_enabled():
+            registration_worker_id = get_str(key("registration_worker", "heartbeat"))
+            if registration_worker_id:
+                cluster_running = True
     except Exception:
         pass
 
@@ -390,6 +395,7 @@ def status(*, light: bool = False) -> dict[str, Any]:
         "running": bool(cluster_running),
         "local_running": local_running,
         "leader_id": leader_id,
+        "worker_id": registration_worker_id,
         "target": _target(),
         "batch_size": _batch_size(),
         "concurrency": _concurrency(),

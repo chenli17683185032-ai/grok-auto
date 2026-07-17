@@ -84,8 +84,9 @@ RUN chmod +x /app/entrypoint.sh \
     && mkdir -p /app/turnstile-solver/logs /app/turnstile-solver/keys \
     && test -f /app/grok-build-auth/xconsole_client/client.py \
     && test -f /app/grok_build_adapter.py \
+    && test -f /app/registration_worker.py \
     && test -f /app/turnstile-solver/api_solver.py \
-    && python -c "import grok_build_adapter, app; print('build-check', app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD)"
+    && python -c "import grok_build_adapter, registration_worker, app; print('build-check', app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD)"
 
 EXPOSE 3000 5072
 
