@@ -18,12 +18,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GROK2API_LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
     LOCAL_SOLVER_URL=http://127.0.0.1:5072 \
     GROK2API_INLINE_SOLVER=1 \
-    GROK2API_REG_CONCURRENCY=1 \
-    GROK2API_REG_PREFETCH_SLOTS=0 \
     TURNSTILE_HOST=127.0.0.1 \
     TURNSTILE_PORT=5072 \
-    TURNSTILE_THREAD=1 \
-    TURNSTILE_NICE=10 \
+    TURNSTILE_THREAD=3 \
     TURNSTILE_BROWSER_TYPE=camoufox \
     TURNSTILE_LAZY=1 \
     TURNSTILE_IDLE_SEC=180
@@ -74,6 +71,13 @@ RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
 # Prefetch browser binaries used by inline solver
 RUN python -m camoufox fetch \
     && python -m patchright install chromium || true
+
+# Keep foreground-safe runtime defaults after the expensive dependency layers
+# so tuning them does not invalidate browser and Python package caches.
+ENV GROK2API_REG_CONCURRENCY=1 \
+    GROK2API_REG_PREFETCH_SLOTS=0 \
+    TURNSTILE_THREAD=1 \
+    TURNSTILE_NICE=10
 
 COPY . /app
 RUN chmod +x /app/entrypoint.sh \

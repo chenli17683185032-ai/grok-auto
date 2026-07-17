@@ -37,6 +37,7 @@ class ApiPriorityDefaultsTests(unittest.TestCase):
 
     def test_server_compose_wires_api_priority_controls(self) -> None:
         compose = (ROOT / "docker-compose.server.yml").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn('TURNSTILE_THREAD: "${TURNSTILE_THREAD:-1}"', compose)
         self.assertIn(
@@ -48,6 +49,15 @@ class ApiPriorityDefaultsTests(unittest.TestCase):
             compose,
         )
         self.assertIn('TURNSTILE_NICE: "${TURNSTILE_NICE:-10}"', compose)
+        dependency_layer = dockerfile.index("python -m camoufox fetch")
+        self.assertGreater(
+            dockerfile.index("GROK2API_REG_CONCURRENCY=1", dependency_layer),
+            dependency_layer,
+        )
+        self.assertGreater(
+            dockerfile.index("TURNSTILE_THREAD=1", dependency_layer),
+            dependency_layer,
+        )
 
     def test_entrypoint_runs_solver_below_api_priority(self) -> None:
         entrypoint = (ROOT / "entrypoint.sh").read_text(encoding="utf-8")
