@@ -2,9 +2,9 @@
 
 **日期：** 2026-07-18
 
-**状态：** 计划已建立，尚未修改生产代码
+**状态：** 完成；API 隔离已上线，注册因外部验证码阻塞安全保持关闭
 
-**代码基线：** `ebd59fdf3c2cfe97ebf9237b251ad8730e1cdbe1`
+**当前候选：** `32bb09f9137162787b808531c923a541ef410cf2`
 
 **实施分支：** `codex/grok-registration-isolation`
 
@@ -119,7 +119,7 @@
 - [x] 节点 5：先补隔离/worker 测试，再实现独立注册 worker 与 Compose 资源边界。
 - [x] 节点 6：完成定向回归、Compose/静态验证和服务器同构候选。
 - [x] 节点 7：有界切换 API 容器，验证无浏览器、无注册线程和 5 路并发。
-- [ ] 节点 8：启动低占空比注册 worker，完成至少 3 个周期的资源与 API 闭环。
+- [x] 节点 8：完成受控单批次试验并确认本地验证码阻塞，按停止条件保持注册关闭。
 - [ ] 节点 9：更新运维手册、快进合并 GitHub `main`，清理临时工件并保留最终回滚点。
 
 ## 10. 实施反馈
@@ -156,3 +156,42 @@
 - 修正保持后台/管理页面单会话兼容，只为自动维护器增加 `force_batch=True`，让单次尝试仍创建持久 batch id；缺失 batch id 时立即停止全部活跃会话并进入 start_error，不能继续循环派发。
 - 同时修复 start_error 分支重复传入 `last_error` 的异常，并让停止全部注册直接跳过已终态历史会话，缩短 SIGTERM 清场时间。新增 5 项回归后隔离/批次测试 13 项通过，相关 unittest 合计 48 项通过；注册保持停止，等待第二候选镜像。
 - 第二候选首次镜像回归发现新增测试污染验证码 provider 全局状态，导致后续 Turnstile fallback 用例失败；生产未改动。测试已改为同时恢复 `os.environ` 与 adapter 全局变量，按实际发现顺序运行的 48 项回归重新全部通过，不绕过失败结果。
+
+### 10.6 最终批次修正候选与 API 复验
+
+- 最终候选为 `grokcli-2api:20260718-registration-isolation-32bb09f`，镜像 ID `sha256:0cc293298668b6474603c0d338a3348e7ba12de5f45785c54868581ea77f7519`，revision 标签精确指向 `32bb09f9137162787b808531c923a541ef410cf2`。镜像内相关 unittest 48 项、prompt-cache 9 项，共 57 项通过。
+- 2026-07-18 04:02（Asia/Shanghai）只重建 API 容器，13 秒恢复 healthy；PostgreSQL、Redis 和 egress 身份不变。API 容器为 2 CPU / 2 GiB / 256 PID，`restart=0`、`oom=0/oom_kill=0`，无 Solver、Camoufox 或注册线程。
+- API 冷缓存首轮 5/5 业务成功，但账号池预热使 `local` 最高达到 755ms；紧接的稳定态 5/5 仍全部成功，`local=43–122ms`，首模型内容约 1.47–1.82 秒。注册停止后的独立复验也是 5/5，`local=65–369ms`，五路使用五个不同账号。
+- 成功备份为 `/home/deploy/grok-backups/20260718T040204-32bb09f-registration-isolation`；该备份和固定回滚镜像继续保留。
+
+### 10.7 修正后单批次试跑触发主机负载停止条件
+
+- 启动前确认注册 runner 锁 0、worker 心跳 0，并仅删除一条过期 maintainer 控制状态；账号、会话和批次审计数据均保留。注册容器实测为 0.5 CPU / 1.5 GiB / 256 PID、无公开端口、`restart=0`。
+- 修正契约真实生效：日志只创建一个非空 `batch_*`，该批次 `count=1` 且只挂一个 session，adapter build 为 `2026-07-18-reg-single-batch-1`，没有再次出现空 batch id 或重复派发。
+- Camoufox 求解期间注册容器约升至 0.96 GiB / 175 PID，主机 1 分钟 load 连续为 `4.36 -> 4.65 -> 5.24`；API 全程 healthy、公网 200、`restart=0`、`oom=0`，但达到计划定义的主机负载停止条件。外部监测器在第三个连续样本后只停止注册容器，退出码 0、未自动重启，API 未被停止或重建。
+- 生产注册当前保持 stopped。虽然 cgroup 半核限制避免了 CPU 实际耗尽，但不能用“API 尚未失败”替代资源门槛，本轮不放宽 load、内存或 PID 阈值。
+
+### 10.8 下一轮最小资源实验
+
+- 已保存的 `yescaptcha_key` 实际只是本地求解器哨兵值 `local`；YesCaptcha `/getBalance` 返回 `ERROR_KEY_DOES_NOT_EXIST`，因此当前不能切到外部验证码服务，也不会假设存在未配置的付费依赖。
+- 现有 Solver 和镜像原生支持 Patchright Chromium。首个临时 Chromium canary 仍只创建一个非空 batch 和一个 session；约 64 秒后资源为 996 MiB / 144 PID，低于 Camoufox 的 PID，但 1 分钟 load 连续 `4.58 -> 4.62 -> 4.33`，旧停止器按规则协作停止 canary。canary 为 `exit=0`、`oom=false`、`restart=0`，API 仍 healthy。
+- 该试验暴露出 load average 不是 cgroup CPU 限制下的充分测量：注册硬上限仅 0.5 CPU，Linux 仍把 cgroup 内被限流的可运行浏览器线程计入 load。停止后系统 CPU PSI `full=0`、内存 PSI `some/full=0`，可用内存 5.4 GiB；高 load 没有对应到 CPU 实际吃满、内存压力或 API 退化。
+- 下一轮不放宽资源，而把 canary 硬边界进一步收紧为 0.5 CPU / 1.25 GiB / 192 PID，软熔断为 1.1 GiB / 160 PID，浏览器空闲回收缩短到 30 秒、批次休息延长到 900 秒。主机停止反馈改为真实 CPU idle 连续低于 25%、可用内存低于 3 GiB、memory PSI full 非零，或任何 API health/restart/OOM/业务延迟失败；load 继续记录但不再作为单独停止执行器。
+- 只有 Chromium 单次注册完整进入终态、资源低于新边界、活跃时 5 路 API 业务成功且浏览器有界回收后，才会把注册服务改为这组更小的正式边界并重新开始三周期验收。任何阶段都不增加注册并发、批次、预取或 API 资源。
+
+### 10.9 浏览器后端与低资源 Solver 反馈
+
+- 收紧到 0.5 CPU / 1.25 GiB / 192 PID 后，Chromium 单批次在约 0.68 GiB / 148 PID 内稳定运行，主机真实 CPU idle 始终高于 44%、memory PSI 为 0；活跃期 5 路 API 为 5/5，服务端 `local=19–98ms`。但本地验证码连续出现 120 秒超时和 `ERROR_CAPTCHA_UNSOLVABLE`，批次 0/1，故 Chromium 不能作为生产注册后端。
+- 同边界的未优化 Camoufox 在活跃期 5 路 API 仍为 5/5，`local=36–197ms`；但内存连续超过 1.15 GiB 软线并在约 1.19 GiB 自动停止。API、公网、OOM、restart 均未异常，证明隔离有效，但该工作集不满足更紧目标。
+- Camoufox 官方接口支持 `block_images=True` 和 `enable_cache=False`。加入这两个最小选项后，真实 canary 峰值约 1.00 GiB / 176 PID，未触发 1.15 GiB / 180 PID 软线，终态后回收到约 240 MiB / 15 PID；Solver 浏览器池回归从 20 项增加到 21 项并全部通过。
+- 该低资源批次仍为 0/1，但 Solver 明确日志显示根因：OneTrust `#onetrust-consent-sdk` 横幅持续拦截 `.cf-turnstile` 点击，30 次等待耗尽。这不是资源边界或账号协议失败。下一修正只要求点击策略先接受 `#onetrust-accept-btn-handler`，失败时移除该遮罩；不扩大超时、重试、并发或资源。
+- Cookie 遮挡回归已先失败再实现，21 项 Solver 回归通过。下一步仍以只读挂载单文件的临时 canary 验证；只有实际注册成功后才构建和部署新镜像。
+
+### 10.10 最终停止判定与生产状态
+
+- 继续对照 GitHub `D3-vin/Turnstile-Solver-NEW@be0a2de`（v1.3，2026-07-14），以临时只读挂载验证 route-first、OneTrust 清理和真实 iframe 坐标点击。所有变体均保持 1 batch / 1 session、0.5 CPU、1.25 GiB、192 PID、软熔断和 API watchdog；但真实批次仍为 0/1，表现为 120 秒超时后 `ERROR_CAPTCHA_UNSOLVABLE`。
+- 这些 Solver 实验没有通过“至少成功注册一个账号”的发布门槛，因此没有构建镜像、没有写入生产源码、没有进入 Git。实验代码已从工作区撤回，原 20 项浏览器池回归重新通过；只保留已真实验收的 API/注册隔离与单批次契约修复。
+- 资源闭环本身成立：不同浏览器活跃期的 5 路真实 API 均为 5/5，服务端 `local` 分别为 19–98ms 和 36–197ms；API 始终 healthy、restart=0、oom/oom_kill=0。cgroup 半核限额下 load 会计入被限流线程，最终以真实 CPU idle、memory PSI、可用内存和 API 业务延迟作为稳定性反馈，未观察到整机资源压力。
+- 最终清理后，生产注册容器数 0、runner 锁 0、worker 心跳 0，过期 maintainer 控制状态已删除；账号、session 和 batch 审计数据未删除。所有 canary 和临时服务器挂载目录已删除。
+- 最终 API 仍运行 `grokcli-2api:20260718-registration-isolation-32bb09f`：healthy、restart=0、oom/oom_kill=0，约 654 MiB / 53 PID；公网与本地状态连续 10/10 为 200，主机 load `1.17 / 1.72 / 1.92`、可用内存 5.4 GiB。
+- 账号注册当前不会自动恢复。重新开启必须先满足其一：配置一枚经余额接口验证有效的外部 YesCaptcha 密钥并让注册容器关闭内联 Solver；或把浏览器注册 worker 迁移到独立主机并通过私网连接共享存储。任一路径仍须从单账号、单并发、0 预取开始重新完成三周期验收，禁止直接启动当前本地浏览器服务。
