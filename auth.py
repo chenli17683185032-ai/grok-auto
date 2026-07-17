@@ -139,23 +139,43 @@ def _pick_entry(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 _live_creds_cache_lock = threading.RLock()
 _live_creds_cache: dict[str, Any] = {
     "at": 0.0,
+    "loaded_at": 0.0,
     "path": None,
     "include_expired": None,
     "creds": None,
+    "generation": 0,
+    "refreshing": False,
+    "refresh_not_before": 0.0,
 }
 _LIVE_CREDS_CACHE_TTL = float(os.getenv("GROK2API_LIVE_CREDS_CACHE_TTL", "2.0") or 2.0)
+_LIVE_CREDS_STALE_MAX_SEC = max(
+    _LIVE_CREDS_CACHE_TTL,
+    float(os.getenv("GROK2API_LIVE_CREDS_STALE_MAX_SEC", "60") or 60),
+)
 
 
 def invalidate_live_credentials_cache() -> None:
+    schedule = False
     with _live_creds_cache_lock:
+        if _live_creds_cache.get("creds") is not None:
+            if not _live_creds_cache.get("loaded_at"):
+                _live_creds_cache["loaded_at"] = float(
+                    _live_creds_cache.get("at") or time.time()
+                )
+            schedule = True
         _live_creds_cache["at"] = 0.0
-        _live_creds_cache["creds"] = None
+        _live_creds_cache["generation"] = int(
+            _live_creds_cache.get("generation") or 0
+        ) + 1
+    if schedule:
+        _schedule_live_credentials_refresh()
 
 
 def get_cached_live_credentials(
     path: Path | None = None,
     *,
     include_expired: bool = False,
+    allow_stale: bool = False,
 ) -> list[GrokCredentials] | None:
     """Return warm process-local live-creds cache only (no rebuild / no IO).
 
@@ -165,15 +185,120 @@ def get_cached_live_credentials(
     path = path or AUTH_FILE
     now = time.time()
     with _live_creds_cache_lock:
+        loaded_at = float(
+            _live_creds_cache.get("loaded_at")
+            or _live_creds_cache.get("at")
+            or now
+        )
+        fresh = (
+            now - float(_live_creds_cache.get("at") or 0.0)
+            < max(0.2, _LIVE_CREDS_CACHE_TTL)
+        )
+        bounded_stale = now - loaded_at < _LIVE_CREDS_STALE_MAX_SEC
+        cache_includes_expired = bool(
+            _live_creds_cache.get("include_expired")
+        )
         if (
             _live_creds_cache.get("creds") is not None
             and _live_creds_cache.get("path") == str(path)
-            and bool(_live_creds_cache.get("include_expired")) == bool(include_expired)
-            and now - float(_live_creds_cache.get("at") or 0.0)
-            < max(0.2, _LIVE_CREDS_CACHE_TTL)
+            and (cache_includes_expired or not include_expired)
+            and (fresh or (allow_stale and bounded_stale))
         ):
-            return list(_live_creds_cache["creds"])
+            credentials = list(_live_creds_cache["creds"])
+            if not include_expired:
+                credentials = [credential for credential in credentials if not credential.expired]
+            return credentials
     return None
+
+
+def _build_live_credentials(
+    path: Path,
+    *,
+    include_expired: bool,
+) -> list[GrokCredentials]:
+    try:
+        data = _read_auth(path)
+    except AuthError:
+        return []
+
+    # Never fan out refresh across the whole pool here. Background maintenance
+    # owns token refresh; this snapshot build is local parsing only.
+    out: list[GrokCredentials] = []
+    for name, entry, _exp in _iter_entries(data):
+        try:
+            creds = _entry_to_creds(name, entry)
+        except AuthError:
+            continue
+        if include_expired or not creds.expired:
+            out.append(creds)
+    out.sort(key=lambda c: c.expires_at or 0.0, reverse=True)
+    return out
+
+
+def _store_live_credentials_snapshot(
+    path: Path,
+    *,
+    include_expired: bool,
+    credentials: list[GrokCredentials],
+    generation: int,
+) -> None:
+    now = time.time()
+    with _live_creds_cache_lock:
+        current_generation = int(_live_creds_cache.get("generation") or 0)
+        _live_creds_cache["path"] = str(path)
+        _live_creds_cache["include_expired"] = bool(include_expired)
+        _live_creds_cache["creds"] = list(credentials)
+        _live_creds_cache["loaded_at"] = now
+        # A write that raced this rebuild marks it stale immediately. The next
+        # request schedules one more refresh instead of trusting a torn view.
+        _live_creds_cache["at"] = now if current_generation == generation else 0.0
+
+
+def _refresh_live_credentials_snapshot(
+    path: Path,
+    include_expired: bool,
+    generation: int,
+) -> None:
+    try:
+        credentials = _build_live_credentials(
+            path,
+            include_expired=include_expired,
+        )
+        _store_live_credentials_snapshot(
+            path,
+            include_expired=include_expired,
+            credentials=credentials,
+            generation=generation,
+        )
+    finally:
+        with _live_creds_cache_lock:
+            _live_creds_cache["refreshing"] = False
+
+
+def _schedule_live_credentials_refresh() -> None:
+    now = time.time()
+    with _live_creds_cache_lock:
+        path_raw = _live_creds_cache.get("path")
+        if not path_raw or _live_creds_cache.get("creds") is None:
+            return
+        if _live_creds_cache.get("refreshing"):
+            return
+        if now < float(_live_creds_cache.get("refresh_not_before") or 0.0):
+            return
+        _live_creds_cache["refreshing"] = True
+        _live_creds_cache["refresh_not_before"] = now + max(
+            0.5,
+            _LIVE_CREDS_CACHE_TTL,
+        )
+        generation = int(_live_creds_cache.get("generation") or 0)
+        include_expired = bool(_live_creds_cache.get("include_expired"))
+        path = Path(str(path_raw))
+    threading.Thread(
+        target=_refresh_live_credentials_snapshot,
+        args=(path, include_expired, generation),
+        name="g2a-live-creds-refresh",
+        daemon=True,
+    ).start()
 
 
 def list_live_credentials(
@@ -191,48 +316,29 @@ def list_live_credentials(
     """
     path = path or AUTH_FILE
     # Request path never network-refreshes here; cache by include_expired only.
-    cached = get_cached_live_credentials(path, include_expired=include_expired)
+    # Keep one canonical full snapshot. Health/model probes derive their
+    # live-only view by filtering it, so they cannot evict the request cache.
+    cached = get_cached_live_credentials(path, include_expired=True)
     if cached is not None:
-        return cached
-    now = time.time()
-    with _live_creds_cache_lock:
-        if (
-            _live_creds_cache.get("creds") is not None
-            and _live_creds_cache.get("path") == str(path)
-            and bool(_live_creds_cache.get("include_expired")) == bool(include_expired)
-            and now - float(_live_creds_cache.get("at") or 0.0) < max(0.2, _LIVE_CREDS_CACHE_TTL)
-        ):
-            # Return a shallow copy so callers can reorder safely.
-            return list(_live_creds_cache["creds"])
+        return cached if include_expired else [c for c in cached if not c.expired]
+    stale = get_cached_live_credentials(
+        path,
+        include_expired=True,
+        allow_stale=True,
+    )
+    if stale is not None:
+        _schedule_live_credentials_refresh()
+        return stale if include_expired else [c for c in stale if not c.expired]
 
-    try:
-        data = _read_auth(path)
-    except AuthError:
-        return []
-
-    # IMPORTANT: never fan-out refresh across the whole pool here.
-    # With 700+ accounts this used to open hundreds of OIDC calls + rewrite
-    # auth.json per account and freeze WSL. Background token_maintainer owns
-    # bulk refresh. Request path must stay O(n) pure CPU over the map — any
-    # network refresh here directly inflates TTFT / first-token latency.
-    out: list[GrokCredentials] = []
-    for name, entry, _exp in _iter_entries(data):
-        try:
-            creds = _entry_to_creds(name, entry)
-        except AuthError:
-            continue
-        # still usable if has refresh_token even when access near-expired
-        if include_expired or not creds.expired or creds.refresh_token:
-            if include_expired or not creds.expired:
-                out.append(creds)
-    # newest expiry first for stable ordering
-    out.sort(key=lambda c: c.expires_at or 0.0, reverse=True)
-    with _live_creds_cache_lock:
-        _live_creds_cache["at"] = time.time()
-        _live_creds_cache["path"] = str(path)
-        _live_creds_cache["include_expired"] = bool(include_expired)
-        _live_creds_cache["creds"] = list(out)
-    return out
+    generation = int(_live_creds_cache.get("generation") or 0)
+    out = _build_live_credentials(path, include_expired=True)
+    _store_live_credentials_snapshot(
+        path,
+        include_expired=True,
+        credentials=out,
+        generation=generation,
+    )
+    return out if include_expired else [c for c in out if not c.expired]
 
 
 def load_credentials(

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,6 +41,7 @@ import openai_responses as oai_resp
 import token_maintainer
 from admin_routes import router as admin_router
 from auth import AuthError, GrokCredentials, load_credentials, upstream_headers
+from store import account_leases
 from config import (
     FORCE_UPSTREAM_STREAM,
     HOST,
@@ -1607,6 +1608,7 @@ class RequestTiming:
         "chain_n",
         "attempt",
         "affinity",
+        "latency_reported",
         "logged",
     )
 
@@ -1632,6 +1634,7 @@ class RequestTiming:
         self.chain_n = 0
         self.attempt = 0
         self.affinity = False
+        self.latency_reported = False
         self.logged = False
 
     def mark_affinity(self, prefer_account: str | None = None) -> None:
@@ -1672,6 +1675,28 @@ class RequestTiming:
         if self.t_first_token is not None:
             return
         self.t_first_token = time.perf_counter()
+        if (
+            not self.latency_reported
+            and self.account_id
+            and self.model
+            and self.t_upstream_start is not None
+        ):
+            self.latency_reported = True
+            latency_ms = max(
+                0.0,
+                (self.t_first_token - self.t_upstream_start) * 1000.0,
+            )
+            try:
+                asyncio.get_running_loop().create_task(
+                    asyncio.to_thread(
+                        account_pool.report_latency,
+                        self.account_id,
+                        model=self.model,
+                        latency_ms=latency_ms,
+                    )
+                )
+            except RuntimeError:
+                pass
         self.emit(ok=True, first=kind)
 
     def emit(self, *, ok: bool = True, first: str | None = None, error: str | None = None) -> None:
@@ -2971,6 +2996,34 @@ def _pick_account_chain_timed(
     return chain, max(0.0, (time.perf_counter() - t0) * 1000.0)
 
 
+async def _reserve_account_chain(
+    chain: list[GrokCredentials],
+    *,
+    preferred_account_id: str | None,
+) -> tuple[account_leases.LeasedAccountChain, float]:
+    started = time.perf_counter()
+    leased = await asyncio.to_thread(
+        account_leases.reserve_chain,
+        chain,
+        preferred_account_id=preferred_account_id,
+    )
+    elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+    if not leased:
+        raise AuthError("All selected accounts are busy; retry shortly.")
+    try:
+        from store.metrics import inc
+
+        if leased.busy_count:
+            inc("g2a_account_lease_busy_total", leased.busy_count)
+        if leased.affinity_spillover:
+            inc("g2a_account_lease_spillover_total")
+        if leased.degraded:
+            inc("g2a_account_lease_degraded_total")
+    except Exception:
+        pass
+    return leased, elapsed_ms
+
+
 def _note_request_metrics(
     *,
     prefer_account: str | None,
@@ -2993,6 +3046,7 @@ def _note_request_metrics(
 async def chat_completions(
     req: ChatCompletionRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
 ):
     if not req.messages:
@@ -3023,7 +3077,12 @@ async def chat_completions(
             ),
             asyncio.to_thread(build_upstream_body, req, model),
         )
-        timing.mark_pick(chain, elapsed_ms=pick_ms)
+        chain, lease_ms = await _reserve_account_chain(
+            chain,
+            preferred_account_id=prefer_account,
+        )
+        background_tasks.add_task(account_leases.release_chain, chain)
+        timing.mark_pick(chain, elapsed_ms=pick_ms + lease_ms)
     except AuthError as e:
         try:
             from store.metrics import inc
@@ -3034,6 +3093,7 @@ async def chat_completions(
         timing.emit(ok=False, error=str(e))
         return _client_pool_error(e)
 
+    affinity_update_fp = None if chain.affinity_spillover else conv_fp
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
 
     url = f"{UPSTREAM_BASE}/chat/completions"
@@ -3060,7 +3120,7 @@ async def chat_completions(
                 model=model,
                 created=created,
                 client_disconnected=request.is_disconnected,
-                conversation_fp=conv_fp,
+                conversation_fp=affinity_update_fp,
                 api_key_id=key_id,
                 usage_ctx=_capture_usage_request_ctx(request),
                 timing=timing,
@@ -3074,6 +3134,9 @@ async def chat_completions(
                 "Content-Type": "text/event-stream; charset=utf-8",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                "X-Grok2API-Affinity-Spillover": (
+                    "1" if chain.affinity_spillover else "0"
+                ),
                 **compact_hdr,
                 **(
                     {"X-Grok2API-Conversation-Fp": conv_fp}
@@ -3100,11 +3163,11 @@ async def chat_completions(
             await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
             used = creds
             # Keep multi-turn memory on this account; rebind if failover
-            if conv_fp:
+            if affinity_update_fp:
                 if prefer_account and prefer_account != creds.auth_key:
                     await asyncio.to_thread(
                         conversation_affinity.rebind_on_failover,
-                        conv_fp,
+                        affinity_update_fp,
                         first_tried,
                         creds.auth_key,
                     )
@@ -3116,7 +3179,9 @@ async def chat_completions(
                         pass
                 else:
                     await asyncio.to_thread(
-                        conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                        conversation_affinity.bind_affinity,
+                        affinity_update_fp,
+                        creds.auth_key,
                     )
             message: dict[str, Any] = {
                 "role": "assistant",
@@ -3160,6 +3225,9 @@ async def chat_completions(
             # non-standard but useful for multi-account debugging
             result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
+            result["x_grok2api_affinity_spillover"] = bool(
+                chain.affinity_spillover
+            )
             hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
             if isinstance(hc_stats, dict):
                 result["x_grok2api_history_compact"] = hc_stats
@@ -3299,6 +3367,7 @@ async def _stream_proxy_with_failover(
         ):
             yield chunk
     finally:
+        await asyncio.to_thread(account_leases.release_chain, chain)
         _reset_usage_request_ctx(_usage_tok)
 
 
@@ -4215,6 +4284,7 @@ def _anthropic_error_response(
 async def anthropic_messages(
     req: anth.AnthropicMessagesRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
     api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
 ):
@@ -4273,7 +4343,12 @@ async def anthropic_messages(
             ),
             asyncio.to_thread(_build_anthropic_body),
         )
-        timing.mark_pick(chain, elapsed_ms=pick_ms)
+        chain, lease_ms = await _reserve_account_chain(
+            chain,
+            preferred_account_id=prefer_account,
+        )
+        background_tasks.add_task(account_leases.release_chain, chain)
+        timing.mark_pick(chain, elapsed_ms=pick_ms + lease_ms)
     except AuthError as e:
         try:
             from store.metrics import inc
@@ -4292,6 +4367,7 @@ async def anthropic_messages(
         return _anthropic_error_response(
             detail, status=503, err_type="api_error", retry_after=8
         )
+    affinity_update_fp = None if chain.affinity_spillover else conv_fp
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
@@ -4305,7 +4381,7 @@ async def anthropic_messages(
                 message_id=message_id,
                 model=model,
                 client_disconnected=request.is_disconnected,
-                conversation_fp=conv_fp,
+                conversation_fp=affinity_update_fp,
                 api_key_id=key_id,
                 usage_ctx=_capture_usage_request_ctx(request),
                 timing=timing,
@@ -4319,6 +4395,9 @@ async def anthropic_messages(
                 "X-Grok2API-Protocol": "anthropic",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                "X-Grok2API-Affinity-Spillover": (
+                    "1" if chain.affinity_spillover else "0"
+                ),
                 **compact_hdr,
                 **(
                     {"X-Grok2API-Conversation-Fp": conv_fp}
@@ -4339,11 +4418,11 @@ async def anthropic_messages(
                 url=url, headers=headers, body=body
             )
             await asyncio.to_thread(account_pool.report_success, creds.auth_key, model=model)
-            if conv_fp:
+            if affinity_update_fp:
                 if prefer_account and prefer_account != creds.auth_key:
                     await asyncio.to_thread(
                         conversation_affinity.rebind_on_failover,
-                        conv_fp,
+                        affinity_update_fp,
                         first_tried,
                         creds.auth_key,
                     )
@@ -4355,7 +4434,9 @@ async def anthropic_messages(
                         pass
                 else:
                     await asyncio.to_thread(
-                        conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                        conversation_affinity.bind_affinity,
+                        affinity_update_fp,
+                        creds.auth_key,
                     )
 
             result = anth.openai_completion_to_anthropic(
@@ -4403,6 +4484,9 @@ async def anthropic_messages(
             # non-standard debug fields (ignored by strict SDKs that allow extra)
             result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
+            result["x_grok2api_affinity_spillover"] = bool(
+                chain.affinity_spillover
+            )
             if conv_fp:
                 result["x_grok2api_conversation_fp"] = conv_fp
             return result
@@ -4523,6 +4607,7 @@ def _responses_affinity(
 @app.post("/responses")
 async def openai_responses(
     request: Request,
+    background_tasks: BackgroundTasks,
     api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
 ):
     """OpenAI Responses API compatibility endpoint.
@@ -4588,7 +4673,12 @@ async def openai_responses(
             ),
             asyncio.to_thread(_prepare_responses_body),
         )
-        timing.mark_pick(chain, elapsed_ms=pick_ms)
+        chain, lease_ms = await _reserve_account_chain(
+            chain,
+            preferred_account_id=prefer_account,
+        )
+        background_tasks.add_task(account_leases.release_chain, chain)
+        timing.mark_pick(chain, elapsed_ms=pick_ms + lease_ms)
     except AuthError as e:
         try:
             from store.metrics import inc
@@ -4598,6 +4688,7 @@ async def openai_responses(
             pass
         return _client_pool_error(e)
 
+    affinity_update_fp = None if chain.affinity_spillover else conv_fp
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
     url = f"{UPSTREAM_BASE}/chat/completions"
     compact_hdr = _history_compact_headers(body)
@@ -4619,11 +4710,11 @@ async def openai_responses(
                 await asyncio.to_thread(
                     account_pool.report_success, creds.auth_key, model=model
                 )
-                if conv_fp:
+                if affinity_update_fp:
                     if prefer_account and prefer_account != creds.auth_key:
                         await asyncio.to_thread(
                             conversation_affinity.rebind_on_failover,
-                            conv_fp,
+                            affinity_update_fp,
                             first_tried,
                             creds.auth_key,
                         )
@@ -4635,7 +4726,9 @@ async def openai_responses(
                             pass
                     else:
                         await asyncio.to_thread(
-                            conversation_affinity.bind_affinity, conv_fp, creds.auth_key
+                            conversation_affinity.bind_affinity,
+                            affinity_update_fp,
+                            creds.auth_key,
                         )
                 return content, reasoning, finish, usage, tool_calls, creds
             except httpx.HTTPStatusError as e:
@@ -4794,12 +4887,12 @@ async def openai_responses(
                                         model=model,
                                     )
                                 )
-                                if conv_fp:
+                                if affinity_update_fp:
                                     if prefer_account and prefer_account != creds.auth_key:
                                         asyncio.create_task(
                                             asyncio.to_thread(
                                                 conversation_affinity.rebind_on_failover,
-                                                conv_fp,
+                                                affinity_update_fp,
                                                 first_tried,
                                                 creds.auth_key,
                                             )
@@ -4808,7 +4901,7 @@ async def openai_responses(
                                         asyncio.create_task(
                                             asyncio.to_thread(
                                                 conversation_affinity.bind_affinity,
-                                                conv_fp,
+                                                affinity_update_fp,
                                                 creds.auth_key,
                                             )
                                         )
@@ -4991,6 +5084,7 @@ async def openai_responses(
                 ):
                     yield frame
             finally:
+                await asyncio.to_thread(account_leases.release_chain, chain)
                 _reset_usage_request_ctx(_usage_tok)
 
         return StreamingResponse(
@@ -5004,6 +5098,9 @@ async def openai_responses(
                 "X-Grok2API-Protocol": "openai_responses",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                "X-Grok2API-Affinity-Spillover": (
+                    "1" if chain.affinity_spillover else "0"
+                ),
                 **compact_hdr,
                 **(
                     {"X-Grok2API-Conversation-Fp": conv_fp}
@@ -5098,6 +5195,7 @@ async def _stream_anthropic_with_failover(
         ):
             yield chunk
     finally:
+        await asyncio.to_thread(account_leases.release_chain, chain)
         _reset_usage_request_ctx(_usage_tok)
 
 

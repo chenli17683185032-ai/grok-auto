@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any
 
@@ -15,6 +16,7 @@ from store.redis_client import (
     redis_enabled,
     set_ex,
     delete,
+    get_client,
 )
 
 
@@ -23,6 +25,66 @@ def rr_next() -> int | None:
     if not redis_enabled():
         return None
     return incr(key("rr", "index"))
+
+
+def _latency_keys(model: str) -> tuple[str, str]:
+    model_hash = hashlib.sha256((model or "default").encode("utf-8")).hexdigest()[:20]
+    return key("latency", model_hash), key("latency_count", model_hash)
+
+
+def record_latency(account_id: str, model: str, latency_ms: float | int) -> float | None:
+    """Update per-model upstream TTFT EWMA and return the new score."""
+    if not redis_enabled() or not account_id:
+        return None
+    try:
+        sample = max(50.0, min(120_000.0, float(latency_ms)))
+    except (TypeError, ValueError):
+        return None
+    client = get_client()
+    if client is None:
+        return None
+    latency_key, count_key = _latency_keys(model)
+    script = """
+    local old = redis.call('zscore', KEYS[1], ARGV[1])
+    local count = tonumber(redis.call('hget', KEYS[2], ARGV[1]) or '0')
+    local sample = tonumber(ARGV[2])
+    local score = sample
+    if old then
+        local alpha = 0.25
+        if count < 3 then alpha = 0.50 end
+        score = tonumber(old) * (1.0 - alpha) + sample * alpha
+    end
+    redis.call('zadd', KEYS[1], score, ARGV[1])
+    redis.call('hincrby', KEYS[2], ARGV[1], 1)
+    return tostring(score)
+    """
+    try:
+        value = client.eval(
+            script,
+            2,
+            latency_key,
+            count_key,
+            account_id,
+            str(sample),
+        )
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def fast_account_ids(model: str, *, limit: int = 32) -> list[str]:
+    """Return the lowest-EWMA accounts; caller still applies health filters."""
+    if not redis_enabled():
+        return []
+    client = get_client()
+    if client is None:
+        return []
+    latency_key, _ = _latency_keys(model)
+    size = max(1, min(256, int(limit or 32)))
+    try:
+        return [str(item) for item in client.zrange(latency_key, 0, size - 1)]
+    except Exception:
+        return []
 
 
 def set_cooldown(account_id: str, until_ts: float) -> None:

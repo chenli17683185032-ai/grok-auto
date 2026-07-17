@@ -1093,6 +1093,23 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
             pass
 
 
+def report_latency(
+    account_id: str | None,
+    *,
+    model: str | None,
+    latency_ms: float | int,
+) -> None:
+    """Feed observed upstream first-token latency into Redis scheduling."""
+    if not account_id or not model:
+        return
+    try:
+        from store.pool_redis import record_latency
+
+        record_latency(account_id, model, latency_ms)
+    except Exception:
+        pass
+
+
 def report_failure(
     account_id: str | None,
     *,
@@ -1757,8 +1774,18 @@ def try_acquire_sequence(
                         limit = max(1, int(MAX_FAILOVER_ATTEMPTS))
                     if limit > 1:
                         cached = get_cached_live_credentials(
-                            include_expired=True
+                            include_expired=True,
+                            allow_stale=True,
                         ) or []
+                        if cached:
+                            try:
+                                from store.pool_redis import rr_next
+
+                                cursor = rr_next()
+                                start = int(cursor or 0) % len(cached)
+                                cached = cached[start:] + cached[:start]
+                            except Exception:
+                                pass
                         sticky_id = first.auth_key or ""
                         sticky_uid = first.user_id or ""
                         # Prefer warm full pool-state cache when present;
@@ -1859,16 +1886,54 @@ def try_acquire_sequence(
         preferred_pool = head
         pool_order = head + rest
     # Round-robin / random only need a rotated window, not whole-pool sort.
+    # Most non-sticky traffic uses the fastest observed accounts, while every
+    # fifth request explores the full pool so the feedback loop keeps learning.
+    rr_cursor: int | None = None
+    fast_pool: list[GrokCredentials] = []
+    if mode == "round_robin" and not prefer_account_id and model and pool_order:
+        try:
+            from store.pool_redis import fast_account_ids, rr_next
+
+            raw_cursor = rr_next()
+            rr_cursor = int(raw_cursor) if raw_cursor is not None else None
+            if rr_cursor is not None and rr_cursor % 5 != 0:
+                fast_ids = fast_account_ids(model, limit=max(32, window_n))
+                by_id = {credential.auth_key: credential for credential in pool_order}
+                fast_pool = [
+                    by_id[account_id]
+                    for account_id in fast_ids
+                    if account_id in by_id
+                ]
+        except Exception:
+            fast_pool = []
+
+    if fast_pool:
+        start = int(rr_cursor or 0) % len(fast_pool)
+        rotated_fast = fast_pool[start:] + fast_pool[:start]
+        pool_window = list(rotated_fast[:window_n])
+        if len(pool_window) < window_n:
+            selected_ids = {credential.auth_key for credential in pool_window}
+            remaining = [
+                credential
+                for credential in pool_order
+                if credential.auth_key not in selected_ids
+            ]
+            if remaining:
+                rest_start = int(rr_cursor or 0) % len(remaining)
+                remaining = remaining[rest_start:] + remaining[:rest_start]
+                pool_window.extend(remaining[: window_n - len(pool_window)])
     if mode == "random" and len(pool_order) > window_n:
         sample = list(pool_order)
         random.shuffle(sample)
         pool_window = sample[:window_n]
+    elif fast_pool:
+        pass
     elif mode != "least_used" and len(pool_order) > window_n:
         start = 0
         try:
             from store.pool_redis import rr_next
 
-            n = rr_next()
+            n = rr_cursor if rr_cursor is not None else rr_next()
             if n is not None and pool_order:
                 start = int(n) % len(pool_order)
             else:
