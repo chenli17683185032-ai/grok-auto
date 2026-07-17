@@ -155,3 +155,4 @@
 - 资源隔离仍按设计生效：错误扩散期间注册 cgroup 峰值约 1.13 GiB / 171 PIDs、CPU 被限制在约 50%，API 约 0.55 GiB / 53 PIDs，两个 cgroup 均 `oom=0/oom_kill=0`。浏览器活跃时 5 路真实 API 为 5/5 业务成功并使用 5 个不同账号，服务端 `local=103–206ms`。
 - 修正保持后台/管理页面单会话兼容，只为自动维护器增加 `force_batch=True`，让单次尝试仍创建持久 batch id；缺失 batch id 时立即停止全部活跃会话并进入 start_error，不能继续循环派发。
 - 同时修复 start_error 分支重复传入 `last_error` 的异常，并让停止全部注册直接跳过已终态历史会话，缩短 SIGTERM 清场时间。新增 5 项回归后隔离/批次测试 13 项通过，相关 unittest 合计 48 项通过；注册保持停止，等待第二候选镜像。
+- 第二候选首次镜像回归发现新增测试污染验证码 provider 全局状态，导致后续 Turnstile fallback 用例失败；生产未改动。测试已改为同时恢复 `os.environ` 与 adapter 全局变量，按实际发现顺序运行的 48 项回归重新全部通过，不绕过失败结果。

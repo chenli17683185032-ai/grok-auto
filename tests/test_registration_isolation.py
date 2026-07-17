@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import tempfile
 import threading
@@ -177,6 +178,10 @@ class SingleAttemptBatchContractTests(unittest.TestCase):
         import grok_build_adapter as adapter
 
         with (
+            patch.dict(os.environ, {}, clear=False),
+            patch.object(adapter, "CAPTCHA_PROVIDER", adapter.CAPTCHA_PROVIDER),
+            patch.object(adapter, "LOCAL_SOLVER_URL", adapter.LOCAL_SOLVER_URL),
+            patch.object(adapter, "YESCAPTCHA_KEY", adapter.YESCAPTCHA_KEY),
             patch.object(adapter, "ensure_xconsole"),
             patch.object(adapter, "_clean_old_sessions"),
             patch.object(adapter, "_mirror_reg_batch"),
