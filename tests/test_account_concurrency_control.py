@@ -188,7 +188,7 @@ class LatencyAwareSelectionTests(unittest.TestCase):
         from store import pool_redis
 
         credentials = [_creds(index) for index in range(100)]
-        fast = credentials[20:24]
+        fast = credentials[20:28]
         replacements = {
             "_ensure_multi_account_layout": lambda: None,
             "get_cached_account_pool_state": lambda: {},
@@ -227,8 +227,46 @@ class LatencyAwareSelectionTests(unittest.TestCase):
                 fast[1].auth_key,
                 fast[2].auth_key,
                 fast[3].auth_key,
-                fast[0].auth_key,
+                fast[4].auth_key,
             ],
+        )
+
+    def test_latency_window_waits_for_eight_distinct_samples(self) -> None:
+        from store import pool_redis
+
+        credentials = [_creds(index) for index in range(100)]
+        replacements = {
+            "_ensure_multi_account_layout": lambda: None,
+            "get_cached_account_pool_state": lambda: {},
+            "list_live_credentials": lambda **_kwargs: list(credentials),
+            "get_account_pool_meta_many": lambda ids: {
+                account_id: {"enabled": True} for account_id in ids
+            },
+            "get_account_mode": lambda: "round_robin",
+        }
+        originals = {name: getattr(account_pool, name) for name in replacements}
+        original_rr_next = pool_redis.rr_next
+        original_fast_ids = pool_redis.fast_account_ids
+        try:
+            for name, replacement in replacements.items():
+                setattr(account_pool, name, replacement)
+            pool_redis.rr_next = lambda: 1
+            pool_redis.fast_account_ids = lambda _model, limit=32: [
+                credential.auth_key for credential in credentials[20:27]
+            ]
+            chain = account_pool.try_acquire_sequence(
+                max_attempts=4,
+                model="grok-4.5",
+            )
+        finally:
+            for name, original in originals.items():
+                setattr(account_pool, name, original)
+            pool_redis.rr_next = original_rr_next
+            pool_redis.fast_account_ids = original_fast_ids
+
+        self.assertEqual(
+            [credential.auth_key for credential in chain],
+            [credential.auth_key for credential in credentials[1:5]],
         )
 
 

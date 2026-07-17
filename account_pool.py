@@ -1898,12 +1898,17 @@ def try_acquire_sequence(
             rr_cursor = int(raw_cursor) if raw_cursor is not None else None
             if rr_cursor is not None and rr_cursor % 5 != 0:
                 fast_ids = fast_account_ids(model, limit=max(32, window_n))
-                by_id = {credential.auth_key: credential for credential in pool_order}
-                fast_pool = [
-                    by_id[account_id]
-                    for account_id in fast_ids
-                    if account_id in by_id
-                ]
+                minimum_feedback = min(8, len(pool_order))
+                if len(fast_ids) >= minimum_feedback:
+                    by_id = {
+                        credential.auth_key: credential
+                        for credential in pool_order
+                    }
+                    fast_pool = [
+                        by_id[account_id]
+                        for account_id in fast_ids
+                        if account_id in by_id
+                    ]
         except Exception:
             fast_pool = []
 
