@@ -28,7 +28,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 GBA = ROOT / "grok-build-auth"
-ADAPTER_BUILD = "2026-07-14-reg-probe-fast-1"
+ADAPTER_BUILD = "2026-07-18-reg-single-batch-1"
 # Kept for the existing registration API/config contract. Production uses 0 so
 # a newly imported account is probed immediately.
 REGISTER_PROBE_DELAY_SEC = float(
@@ -805,12 +805,15 @@ def start_registration(
     concurrency: int | None = None,
     stagger_ms: int | None = None,
     probe_delay_sec: float | int | None = None,
+    force_batch: bool = False,
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
-    ``count`` > 1 enables batch mode. ``concurrency`` is the real in-flight
-    limit: e.g. concurrency=3 means only 3 accounts register at the same time;
-    when one finishes, the next queued account starts.
+    ``count`` > 1 enables batch mode. Internal maintainers may set
+    ``force_batch`` so a one-attempt cycle still has a durable batch id.
+    ``concurrency`` is the real in-flight limit: e.g. concurrency=3 means only
+    3 accounts register at the same time; when one finishes, the next queued
+    account starts.
     """
     try:
         ensure_xconsole()
@@ -924,7 +927,7 @@ def start_registration(
         mail_prov = (mail_provider or "moemail").strip().lower() or "moemail"
 
     # Single job — keep original response shape for UI compatibility.
-    if n == 1:
+    if n == 1 and not force_batch:
         return _start_one_registration(
             yescaptcha_key=key,
             proxy=proxy_val,
@@ -2404,6 +2407,10 @@ def stop_all_active_registrations() -> dict[str, Any]:
     for s in sessions:
         sid = str(s.get("id") or "")
         if not sid:
+            continue
+        status = str(s.get("status") or "").lower()
+        if status in _TERMINAL_STATUSES:
+            already.append(sid)
             continue
         r = stop_registration_session(sid)
         if r.get("already_terminal"):

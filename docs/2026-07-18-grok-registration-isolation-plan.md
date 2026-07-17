@@ -117,8 +117,8 @@
 - [x] 节点 3：建立完整计划、指标、停止条件、部署与回滚边界。
 - [x] 节点 4：协作停止当前大批次并确认 API 持续可用、浏览器有界回收。
 - [x] 节点 5：先补隔离/worker 测试，再实现独立注册 worker 与 Compose 资源边界。
-- [ ] 节点 6：完成定向回归、Compose/静态验证和服务器同构候选。
-- [ ] 节点 7：有界切换 API 容器，验证无浏览器、无注册线程和 5 路并发。
+- [x] 节点 6：完成定向回归、Compose/静态验证和服务器同构候选。
+- [x] 节点 7：有界切换 API 容器，验证无浏览器、无注册线程和 5 路并发。
 - [ ] 节点 8：启动低占空比注册 worker，完成至少 3 个周期的资源与 API 闭环。
 - [ ] 节点 9：更新运维手册、快进合并 GitHub `main`，清理临时工件并保留最终回滚点。
 
@@ -134,3 +134,24 @@
 
 - 新增 5 项初始隔离测试，旧代码表现为 1 个失败和 4 个错误：API 仍允许自动注册/内联 Solver、缺少独立注册服务和 worker 资源熔断入口。
 - 实现后隔离/熔断 8 项、账号并发 11 项、Turnstile 恢复 20 项、原 API 优先 4 项，共 43 项通过；Python 编译、Shell 静态和 Compose `config --quiet` 也通过。prompt-cache 测试仅因本机缺少仓库已声明的 `python-multipart` 依赖而无法导入，将在依赖完整的候选镜像内补跑。
+
+### 10.3 节点 6：镜像与同构 canary
+
+- 不可变候选为 `grokcli-2api:20260718-registration-isolation-cc205a0`，镜像 ID `sha256:201c883b4111ff5593eabbc6f8fc86f9a1db54abcd5d8fec1e36e93e3a1b2cec`，revision 标签精确指向 `cc205a075e55ddba990c8afd0e080803e85f7f5e`。
+- 候选镜像内 43 项 unittest 和 9 项 prompt-cache 函数测试全部通过，共 52 项；Compose 生产渲染通过。
+- 目标设为 1 的无真实注册 canary 达到 healthy：0.5 CPU、1.5 GiB、256 PID 硬限制和 `restart=no` 均与设计一致，无宿主端口且只连接内部网络；空闲使用约 171 MiB、10 PIDs，cgroup `oom=0/oom_kill=0`。
+- canary 启动日志确认 worker 自检为 `batch=1/concurrency=1/rest=600s`，Redis 心跳可见；停止后心跳自动清除。整个验证期间公网 `/api/status` 连续为 200，canary 随后已删除。
+
+### 10.4 节点 7：API 独立故障域上线
+
+- 2026-07-18 03:38（Asia/Shanghai）只重建 `grokcli-2api`，14 秒恢复 healthy，注册服务未创建；PostgreSQL、Redis 和 egress 身份不变，未触发回滚。
+- API cgroup 精确为 2 CPU、2 GiB、256 PIDs；环境为 `GROK2API_INLINE_SOLVER=0`、`GROK2API_REG_AUTO_MAINTAIN=0`。进程表只有主进程和两个 API worker，没有 Solver、forkserver、Camoufox 或 Web Content。
+- 空闲资源从旧结构约 980 MiB / 59 PIDs 降为约 351 MiB / 34 PIDs。5 路真实 SSE 为 5/5 业务成功并使用 5 个不同账号，服务端 `local=111–348ms`、客户端首模型内容中位数约 1.79 秒；压测后约 392 MiB / 47 PIDs，cgroup `oom=0/oom_kill=0`。
+- 成功备份为 `/home/deploy/grok-backups/20260718T033823-cc205a0-registration-isolation`；旧 API 镜像已固定为同 run ID 的 rollback 标签。即使回滚，安全 Compose 仍强制关闭 API 内自动注册和内联 Solver。
+
+### 10.5 节点 8：首轮真实注册反馈与批次契约修正
+
+- 首轮 worker 在真实注册开始后暴露既有契约缺陷：`start_registration(count=1)` 走单会话模式，只返回 session `id`；维护器只读取 `batch_id`，因此记录空 ID并在循环中重复发起了 5 个单会话。检测后立即停止注册容器，心跳清除，容器保持 exited 且 `restart=no`；API 全程持续 200。
+- 资源隔离仍按设计生效：错误扩散期间注册 cgroup 峰值约 1.13 GiB / 171 PIDs、CPU 被限制在约 50%，API 约 0.55 GiB / 53 PIDs，两个 cgroup 均 `oom=0/oom_kill=0`。浏览器活跃时 5 路真实 API 为 5/5 业务成功并使用 5 个不同账号，服务端 `local=103–206ms`。
+- 修正保持后台/管理页面单会话兼容，只为自动维护器增加 `force_batch=True`，让单次尝试仍创建持久 batch id；缺失 batch id 时立即停止全部活跃会话并进入 start_error，不能继续循环派发。
+- 同时修复 start_error 分支重复传入 `last_error` 的异常，并让停止全部注册直接跳过已终态历史会话，缩短 SIGTERM 清场时间。新增 5 项回归后隔离/批次测试 13 项通过，相关 unittest 合计 48 项通过；注册保持停止，等待第二候选镜像。

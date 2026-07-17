@@ -172,5 +172,124 @@ class RegistrationWorkerTests(unittest.TestCase):
         stop_bg.assert_called_once_with()
 
 
+class SingleAttemptBatchContractTests(unittest.TestCase):
+    def test_adapter_can_wrap_one_attempt_in_batch_mode(self) -> None:
+        import grok_build_adapter as adapter
+
+        with (
+            patch.object(adapter, "ensure_xconsole"),
+            patch.object(adapter, "_clean_old_sessions"),
+            patch.object(adapter, "_mirror_reg_batch"),
+            patch.object(
+                adapter,
+                "_spawn_batch_runner",
+                return_value={"ok": True, "batch_id": "unused"},
+            ),
+            patch.object(adapter.time, "sleep"),
+        ):
+            result = adapter.start_registration(
+                captcha_provider="local",
+                count=1,
+                concurrency=1,
+                force_batch=True,
+                mail_provider="yyds",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["batch"])
+        self.assertEqual(result["count"], 1)
+        self.assertTrue(result["batch_id"].startswith("batch_"))
+        adapter._batches.pop(result["batch_id"], None)
+
+    def test_maintainer_requests_batch_envelope_for_one_attempt(self) -> None:
+        import grok_build_adapter as adapter
+        import registration_maintainer as maintainer
+        import settings_store
+
+        with (
+            patch.object(settings_store, "resolve_registration_inputs", return_value={}),
+            patch.object(
+                adapter,
+                "start_registration",
+                return_value={"ok": True, "batch_id": "batch_one"},
+            ) as start,
+        ):
+            result = maintainer._start_batch(1)
+
+        self.assertEqual(result["batch_id"], "batch_one")
+        self.assertIs(start.call_args.kwargs["force_batch"], True)
+
+    def test_maintainer_stops_if_batch_id_is_missing(self) -> None:
+        import grok_build_adapter as adapter
+        import registration_maintainer as maintainer
+        import settings_store
+
+        with (
+            patch.object(settings_store, "resolve_registration_inputs", return_value={}),
+            patch.object(
+                adapter,
+                "start_registration",
+                return_value={"ok": True, "id": "single_session"},
+            ),
+            patch.object(adapter, "stop_all_active_registrations") as stop_all,
+        ):
+            result = maintainer._start_batch(1)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("batch_id", result["error"])
+        stop_all.assert_called_once_with()
+
+    def test_start_failure_publishes_start_error_without_keyword_collision(self) -> None:
+        import registration_maintainer as maintainer
+
+        published: list[dict] = []
+        waits = iter([False, True])
+
+        with (
+            patch.object(maintainer, "_load_remote_state", return_value={}),
+            patch.object(maintainer, "_publish", side_effect=lambda **kw: published.append(kw)),
+            patch.object(maintainer, "_wait", side_effect=lambda _seconds: next(waits)),
+            patch.object(maintainer, "_find_active_batch", return_value=None),
+            patch.object(
+                maintainer,
+                "_pool_counts",
+                return_value={"total": 1, "live": 1, "enabled": 1, "available": 0},
+            ),
+            patch.object(maintainer, "_target", return_value=1),
+            patch.object(maintainer, "_start_batch", return_value={"ok": False, "error": "nope"}),
+        ):
+            maintainer._stop.clear()
+            maintainer._worker()
+
+        self.assertTrue(any(item.get("phase") == "start_error" for item in published))
+        self.assertFalse(
+            any("multiple values" in str(item.get("last_error")) for item in published)
+        )
+
+    def test_stop_all_skips_terminal_session_writes(self) -> None:
+        import grok_build_adapter as adapter
+
+        listed = {
+            "sessions": [
+                {"id": "done", "status": "completed"},
+                {"id": "live", "status": "solving_turnstile"},
+            ],
+            "batches": [],
+        }
+        with (
+            patch.object(adapter, "list_registration_sessions", return_value=listed),
+            patch.object(
+                adapter,
+                "stop_registration_session",
+                return_value={"ok": True, "id": "live"},
+            ) as stop_one,
+        ):
+            result = adapter.stop_all_active_registrations()
+
+        stop_one.assert_called_once_with("live")
+        self.assertEqual(result["stopped_count"], 1)
+        self.assertEqual(result["already_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

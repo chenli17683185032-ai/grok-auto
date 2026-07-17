@@ -201,7 +201,7 @@ def _start_batch(attempts: int) -> dict[str, Any]:
             "probe_delay_sec": 0,
         }
     )
-    return adapter.start_registration(
+    result = adapter.start_registration(
         proxy=resolved.get("proxy") or None,
         moemail_api_key=resolved.get("api_key") or None,
         moemail_base_url=resolved.get("base_url") or None,
@@ -216,7 +216,15 @@ def _start_batch(attempts: int) -> dict[str, Any]:
         concurrency=_concurrency(),
         stagger_ms=0,
         probe_delay_sec=0,
+        force_batch=True,
     )
+    if result.get("ok") and not str(result.get("batch_id") or "").strip():
+        adapter.stop_all_active_registrations()
+        return {
+            "ok": False,
+            "error": "registration adapter returned no batch_id",
+        }
+    return result
 
 
 def _wait(seconds: float) -> bool:
@@ -304,10 +312,9 @@ def _worker() -> None:
                 retry_at = time.time() + 60
                 _publish(
                     phase="start_error",
-                    last_error=error,
                     retry_at=retry_at,
                     rest_until=retry_at,
-                    **base,
+                    **{**base, "last_error": error},
                 )
                 print(f"  [registration-maintainer] start failed: {error}", flush=True)
                 if _wait(60.0):
