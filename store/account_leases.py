@@ -142,11 +142,9 @@ def reserve_chain(
         return LeasedAccountChain(items)
 
     ttl = _lease_ttl()
-    selected: list[Any] = []
-    entries: list[_LeaseEntry] = []
     busy_ids: set[str] = set()
     try:
-        for credential in items:
+        for index, credential in enumerate(items):
             account_id = str(getattr(credential, "auth_key", "") or "").strip()
             if not account_id:
                 continue
@@ -157,26 +155,31 @@ def reserve_chain(
                 ttl=ttl,
             )
             if set_nx_ex(entry.key, entry.token, entry.ttl):
-                selected.append(credential)
-                entries.append(entry)
-            else:
-                busy_ids.add(account_id)
+                backups = [
+                    candidate
+                    for offset, candidate in enumerate(items)
+                    if offset != index
+                    and str(getattr(candidate, "auth_key", "") or "").strip()
+                    not in busy_ids
+                ]
+                group = _LeaseGroup([entry])
+                return LeasedAccountChain(
+                    [credential] + backups,
+                    lease_group=group,
+                    affinity_spillover=bool(
+                        preferred_account_id
+                        and preferred_account_id in busy_ids
+                    ),
+                    busy_count=len(busy_ids),
+                )
+            busy_ids.add(account_id)
     except Exception:
-        for entry in entries:
-            try:
-                compare_and_delete(entry.key, entry.token)
-            except Exception:
-                pass
         # Runtime Redis failure must not turn into a total API outage.
         return LeasedAccountChain(items, degraded=True)
 
-    group = _LeaseGroup(entries) if entries else None
     return LeasedAccountChain(
-        selected,
-        lease_group=group,
-        affinity_spillover=bool(
-            preferred_account_id and preferred_account_id in busy_ids
-        ),
+        [],
+        affinity_spillover=False,
         busy_count=len(busy_ids),
     )
 

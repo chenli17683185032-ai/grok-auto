@@ -162,12 +162,43 @@ class AccountLeaseTests(unittest.TestCase):
             account_leases.release_chain(chain)
             account_leases.release_chain(chain)
 
-        self.assertEqual([item.auth_key for item in chain], [credentials[1].auth_key, credentials[2].auth_key])
+        self.assertEqual(
+            [item.auth_key for item in chain],
+            [credentials[1].auth_key, credentials[2].auth_key],
+        )
         self.assertTrue(chain.affinity_spillover)
         self.assertFalse(chain.degraded)
-        self.assertEqual(len(acquired), 3)
+        self.assertEqual(len(acquired), 2)
         self.assertTrue(all(ttl > 0 for _, _, ttl in acquired))
-        self.assertEqual(len(released), 2)
+        self.assertEqual(len(released), 1)
+
+    def test_concurrent_chains_reserve_only_one_distinct_primary_each(self) -> None:
+        from store import account_leases
+
+        credentials = [_creds(1), _creds(2)]
+        held: set[str] = set()
+
+        def set_nx(key: str, _token: str, _ttl: int) -> bool:
+            if key in held:
+                return False
+            held.add(key)
+            return True
+
+        with (
+            patch.object(account_leases, "redis_enabled", return_value=True),
+            patch.object(account_leases, "set_nx_ex", side_effect=set_nx),
+            patch.object(account_leases, "compare_and_delete", return_value=True),
+            patch.object(account_leases, "_ensure_renew_thread"),
+        ):
+            first = account_leases.reserve_chain(credentials)
+            second = account_leases.reserve_chain(credentials)
+            third = account_leases.reserve_chain(credentials)
+            account_leases.release_chain(first)
+            account_leases.release_chain(second)
+
+        self.assertEqual(first[0].auth_key, credentials[0].auth_key)
+        self.assertEqual(second[0].auth_key, credentials[1].auth_key)
+        self.assertEqual(len(third), 0)
 
     def test_redis_error_degrades_to_original_chain(self) -> None:
         from store import account_leases
