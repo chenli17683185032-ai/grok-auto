@@ -196,6 +196,7 @@ class AccountLeaseTests(unittest.TestCase):
 
         with (
             patch.object(account_leases, "redis_enabled", return_value=True),
+            patch.object(account_leases, "get_cooldown", return_value=None),
             patch.object(account_leases, "set_nx_ex", side_effect=set_nx),
             patch.object(account_leases, "compare_and_delete", side_effect=lambda key, token: released.append((key, token)) or True),
             patch.object(account_leases, "_ensure_renew_thread"),
@@ -231,6 +232,7 @@ class AccountLeaseTests(unittest.TestCase):
 
         with (
             patch.object(account_leases, "redis_enabled", return_value=True),
+            patch.object(account_leases, "get_cooldown", return_value=None),
             patch.object(account_leases, "set_nx_ex", side_effect=set_nx),
             patch.object(account_leases, "compare_and_delete", return_value=True),
             patch.object(account_leases, "_ensure_renew_thread"),
