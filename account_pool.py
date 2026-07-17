@@ -1055,7 +1055,8 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
     """
     if not account_id:
         return
-    meta = _pool_meta(account_id, get_account_pool_state())
+    raw_meta = get_account_pool_meta(account_id)
+    meta = _pool_meta(account_id, {account_id: raw_meta})
     still_cooling = is_in_cooldown(meta)
     # Live traffic never clears cooldown (clear_cooldown always False).
     touch_account_stats(
@@ -1080,8 +1081,7 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
     # account-level cooldown (cooldown recovery is probe-only).
     if model:
         try:
-            state = get_account_pool_state()
-            meta2 = state.get(account_id) or {}
+            meta2 = get_account_pool_meta(account_id)
             blocked = meta2.get("blocked_models") if isinstance(meta2, dict) else None
             if isinstance(blocked, dict) and model in blocked:
                 entry = blocked.get(model) or {}
@@ -1142,8 +1142,8 @@ def report_failure(
         pass
 
     # Read streak before writing so adaptive cooldown can scale.
-    state = get_account_pool_state()
-    meta = _pool_meta(account_id, state)
+    raw_meta = get_account_pool_meta(account_id)
+    meta = _pool_meta(account_id, {account_id: raw_meta})
     prev_streak = int(meta.get("consecutive_fails") or 0)
     streak = prev_streak + 1
 

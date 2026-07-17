@@ -95,6 +95,51 @@ class LiveCredentialsSnapshotTests(unittest.TestCase):
         self.assertTrue(auth._live_creds_cache["include_expired"])
 
 
+class PoolStateSnapshotTests(unittest.TestCase):
+    def test_request_view_can_use_bounded_stale_pool_state(self) -> None:
+        from store import settings_pg
+
+        original_cache = settings_pg._pool_state_cache
+        original_at = settings_pg._pool_state_cache_at
+        original_loaded_at = getattr(
+            settings_pg,
+            "_pool_state_cache_loaded_at",
+            0.0,
+        )
+        try:
+            settings_pg._pool_state_cache = {
+                "account-a": {"enabled": True}
+            }
+            settings_pg._pool_state_cache_at = 0.0
+            settings_pg._pool_state_cache_loaded_at = time.time()
+            cached = settings_pg.get_cached_account_pool_state(
+                allow_stale=True
+            )
+        finally:
+            settings_pg._pool_state_cache = original_cache
+            settings_pg._pool_state_cache_at = original_at
+            settings_pg._pool_state_cache_loaded_at = original_loaded_at
+
+        self.assertEqual(cached, {"account-a": {"enabled": True}})
+
+    def test_success_feedback_never_reads_the_full_pool(self) -> None:
+        with (
+            patch.object(
+                account_pool,
+                "get_account_pool_state",
+                side_effect=AssertionError("success feedback scanned full pool"),
+            ),
+            patch.object(
+                account_pool,
+                "get_account_pool_meta",
+                return_value={"enabled": True},
+            ),
+            patch.object(account_pool, "touch_account_stats"),
+            patch.object(account_pool, "patch_account_pool_meta"),
+        ):
+            account_pool.report_success("account-a")
+
+
 class StickyBackupRotationTests(unittest.TestCase):
     def test_sticky_chain_rotates_warm_backups_with_global_cursor(self) -> None:
         from store import pool_redis

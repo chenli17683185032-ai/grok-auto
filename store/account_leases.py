@@ -18,6 +18,7 @@ from store.redis_client import (
     set_nx_ex,
     worker_id,
 )
+from store.pool_redis import get_cooldown
 
 
 def _lease_ttl() -> int:
@@ -147,6 +148,10 @@ def reserve_chain(
         for index, credential in enumerate(items):
             account_id = str(getattr(credential, "auth_key", "") or "").strip()
             if not account_id:
+                continue
+            cooldown_until = get_cooldown(account_id)
+            if cooldown_until is not None and cooldown_until > time.time():
+                busy_ids.add(account_id)
                 continue
             token = f"{worker_id()}:{uuid.uuid4().hex}"
             entry = _LeaseEntry(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 
@@ -214,21 +215,34 @@ def _row_to_meta(r) -> dict[str, Any]:
 
 _pool_state_cache: dict[str, Any] | None = None
 _pool_state_cache_at = 0.0
+_pool_state_cache_loaded_at = 0.0
 _POOL_STATE_CACHE_TTL = 1.5
+_POOL_STATE_CACHE_STALE_MAX_SEC = max(
+    _POOL_STATE_CACHE_TTL,
+    float(os.getenv("GROK2API_POOL_STATE_STALE_MAX_SEC", "120") or 120),
+)
 
 
 def invalidate_pool_state_cache() -> None:
-    global _pool_state_cache, _pool_state_cache_at
-    _pool_state_cache = None
+    global _pool_state_cache_at, _pool_state_cache_loaded_at
+    if _pool_state_cache is not None and not _pool_state_cache_loaded_at:
+        _pool_state_cache_loaded_at = _pool_state_cache_at or time.time()
     _pool_state_cache_at = 0.0
 
 
-def get_cached_account_pool_state() -> dict[str, Any] | None:
+def get_cached_account_pool_state(
+    *,
+    allow_stale: bool = False,
+) -> dict[str, Any] | None:
     """Return warm process-local pool-state cache only (no DB)."""
     now = time.time()
-    if (
-        _pool_state_cache is not None
-        and now - _pool_state_cache_at < _POOL_STATE_CACHE_TTL
+    fresh = now - _pool_state_cache_at < _POOL_STATE_CACHE_TTL
+    bounded_stale = (
+        now - (_pool_state_cache_loaded_at or _pool_state_cache_at or now)
+        < _POOL_STATE_CACHE_STALE_MAX_SEC
+    )
+    if _pool_state_cache is not None and (
+        fresh or (allow_stale and bounded_stale)
     ):
         return dict(_pool_state_cache)
     return None
@@ -237,7 +251,7 @@ def get_cached_account_pool_state() -> dict[str, Any] | None:
 def get_account_pool_state() -> dict[str, Any]:
     if not enabled():
         return {}
-    global _pool_state_cache, _pool_state_cache_at
+    global _pool_state_cache, _pool_state_cache_at, _pool_state_cache_loaded_at
     cached = get_cached_account_pool_state()
     if cached is not None:
         return cached
@@ -254,7 +268,29 @@ def get_account_pool_state() -> dict[str, Any]:
                 out[str(r[0])] = _row_to_meta(r)
     _pool_state_cache = out
     _pool_state_cache_at = time.time()
+    _pool_state_cache_loaded_at = _pool_state_cache_at
     return dict(out)
+
+
+def _replace_pool_state_cache(state: dict[str, Any]) -> None:
+    global _pool_state_cache, _pool_state_cache_at, _pool_state_cache_loaded_at
+    now = time.time()
+    _pool_state_cache = {
+        str(account_id): dict(meta)
+        for account_id, meta in state.items()
+        if isinstance(meta, dict)
+    }
+    _pool_state_cache_at = now
+    _pool_state_cache_loaded_at = now
+
+
+def _update_pool_state_cache(account_id: str, meta: dict[str, Any]) -> None:
+    global _pool_state_cache
+    if _pool_state_cache is None:
+        return
+    updated = dict(_pool_state_cache)
+    updated[str(account_id)] = dict(meta)
+    _pool_state_cache = updated
 
 
 def get_pool_meta_many(account_ids: list[str]) -> dict[str, Any]:
@@ -477,7 +513,7 @@ def save_account_pool_state(state: dict[str, Any]) -> None:
             for aid in existing - incoming:
                 cur.execute("DELETE FROM account_pool WHERE account_id = %s", (aid,))
         conn.commit()
-    invalidate_pool_state_cache()
+    _replace_pool_state_cache(state)
 
 
 def upsert_pool_meta(account_id: str, meta: dict[str, Any]) -> None:
@@ -487,7 +523,7 @@ def upsert_pool_meta(account_id: str, meta: dict[str, Any]) -> None:
         with conn.cursor() as cur:
             _upsert_pool(cur, account_id, meta, preserve_active_cooldown=True)
         conn.commit()
-    invalidate_pool_state_cache()
+    _update_pool_state_cache(account_id, meta)
 
 
 def patch_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -530,7 +566,7 @@ def patch_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str, Any]:
             meta["pool_status"] = _derive_pool_status(meta)
             _upsert_pool(cur, account_id, meta, preserve_active_cooldown=False)
         conn.commit()
-    invalidate_pool_state_cache()
+    _update_pool_state_cache(account_id, meta)
     return meta
 
 

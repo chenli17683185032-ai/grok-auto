@@ -633,7 +633,12 @@ def get_cached_account_pool_state() -> dict[str, Any] | None:
     if pg is not None:
         try:
             if hasattr(pg, "get_cached_account_pool_state"):
-                cached = pg.get_cached_account_pool_state()
+                try:
+                    cached = pg.get_cached_account_pool_state(
+                        allow_stale=True
+                    )
+                except TypeError:
+                    cached = pg.get_cached_account_pool_state()
                 return dict(cached) if isinstance(cached, dict) else None
         except Exception:
             return None
