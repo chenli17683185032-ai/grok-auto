@@ -222,9 +222,10 @@
 ### 11.6 最终生产闭环
 
 - 最终功能提交为 `7a76e352e63f3b99ec34522d9485732dfc9d3a14`，镜像 `grokcli-2api:20260718-fast-concurrency-7a76e35`（ID `sha256:0ca70699a5aafdd01cb90292c6d2db6e1bd166d1634476865aadb0dbb35a57a0`）。35 项并发/缓存定向测试和 9 项 prompt-cache/粘性测试通过后才进入生产。
-- 2026-07-18 02:33（Asia/Shanghai）只重建 `grokcli-2api`，18 秒恢复 healthy；PostgreSQL、Redis 和 egress 容器身份不变。最终 cgroup `oom=0`、`oom_kill=0`，restart count 为 0；压力后内存约 618MiB / 4GiB、PID 54。
-- 完整 SSE 业务探针共 22/22 成功，均包含实际模型内容、finish frame 和 `[DONE]`，没有把 HTTP 200 内逻辑错误记为成功。5 次顺序请求的客户端首模型内容中位数约 1.46 秒；全部样本服务端 TTFT 中位数约 1.60 秒，显著低于旧基线 9.83 秒。
+- 2026-07-18 02:33（Asia/Shanghai）只重建 `grokcli-2api`，18 秒恢复 healthy；PostgreSQL、Redis 和 egress 容器身份不变。最终 cgroup `oom=0`、`oom_kill=0`，restart count 为 0。API 压测后空闲快照约 618MiB / 4GiB、PID 54；单槽注册浏览器实际运行时的 40 秒采样峰值为 2.05GiB、CPU 220.8% / 250%、PID 230，仍低于 3.2GiB / 450 PID 控制边界。
+- 完整 SSE 业务探针共 27/27 成功，均包含实际模型内容、finish frame 和 `[DONE]`，没有把 HTTP 200 内逻辑错误记为成功。5 次顺序请求的客户端首模型内容中位数约 1.46 秒；全部样本服务端 TTFT 中位数约 1.60 秒，显著低于旧基线 9.83 秒。
 - 两轮普通 5 路并发均为 5/5 成功，每轮使用 5 个不同账号；固定会话种子后的 5 路并发也是 5/5 成功，并由原粘性账号和 4 个临时溢出账号承接。并发结束后的单路请求重新命中原粘性账号，证明溢出没有改写长期绑定。
-- 22 个请求的服务端 `local` p95 约 261ms、最大 453ms，达到小于 500ms 的发布门槛；剩余 TTFT 主要是约 1.1 至 1.5 秒的上游响应头等待，而非本地锁或连接池排队。
+- 单槽注册浏览器活跃时追加的 5 路并发仍为 5/5 成功，并使用 5 个不同账号；客户端首模型内容中位数约 1.76 秒，服务端 `local=63–82ms`。后台 Camoufox/Web Content 为 nice 10，API worker 为 nice 0，证明资源优先级在真实干扰下生效。
+- 27 个请求的服务端 `local` p95 约 261ms、最大 453ms，达到小于 500ms 的发布门槛；剩余 TTFT 主要是约 1.1 至 1.9 秒的上游响应头等待，而非本地锁或连接池排队。
 - 验收期间 token maintainer 实际完成刷新/删除周期，第二轮并发未重现旧版缓存击穿。请求结束后 Redis `account_inflight` 租约键为 0；公网 `/api/status` 最终 10/10 为 200。
 - 成功回滚目录为 `/home/deploy/grok-backups/20260718T023336-7a76e35-fast-concurrency`，旧镜像固定标签为 `grokcli-2api:rollback-20260718T023336-7a76e35-fast-concurrency`。回滚只恢复该目录中的源码和 `.env.before`，并只重建 `grokcli-2api`；不得回滚 PostgreSQL/Redis Volume、账号数据或其它依赖服务。
