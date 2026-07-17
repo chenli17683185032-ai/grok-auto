@@ -63,7 +63,7 @@ LOCAL_SOLVER_URL = (
 # Hard cap for multi-thread registration concurrency only (YesCaptcha + xAI rate limits).
 # Batch count is intentionally uncapped — only concurrency bounds parallelism.
 MAX_CONCURRENCY = int(os.environ.get("GROK2API_REG_MAX_CONCURRENCY", "10") or 10)
-DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "3") or 3)
+DEFAULT_CONCURRENCY = int(os.environ.get("GROK2API_REG_CONCURRENCY", "1") or 1)
 
 
 def _email_code_timeout_sec() -> float:
@@ -90,7 +90,7 @@ _xconsole_error: str | None = None
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
 # How many jobs may be pre-created (mailbox + session) beyond the live concurrency
 # cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
-REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
+REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "0") or 0)
 
 
 def _schedule_probe_retry(account_id: str) -> None:

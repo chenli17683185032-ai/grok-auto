@@ -45,7 +45,7 @@ def _batch_size() -> int:
 
 
 def _concurrency() -> int:
-    return _env_int("GROK2API_REG_CONCURRENCY", 4, 1, 10)
+    return _env_int("GROK2API_REG_CONCURRENCY", 1, 1, 10)
 
 
 def _rest_sec() -> int:

@@ -70,34 +70,38 @@ curl -fsS http://127.0.0.1:3000/health
 
 浏览器打开：`http://127.0.0.1:3000/admin`
 
-#### 启动时指定打码线程数
+#### 注册与过盾资源优先级
 
-主容器内联过盾线程数由 `TURNSTILE_THREAD` 控制（默认与注册并发一致，当前默认 **3**）：
+协议注册和内联过盾属于后台任务，默认各使用 **1** 个并发槽，并且不预取下一项长任务。Camoufox 默认以 nice 10 运行，前台 API worker 保持 nice 0：
 
 ```bash
-# compose 启动时直接传参
-TURNSTILE_THREAD=3 GROK2API_REG_CONCURRENCY=3 docker compose up -d --build
+# 默认安全档，适合 API 与自动注册共用容器
+GROK2API_REG_CONCURRENCY=1 TURNSTILE_THREAD=1 docker compose up -d --build
 
 # 或写入 .env
 # GROK2API_CAPTCHA_PROVIDER=local
 # GROK2API_INLINE_SOLVER=1
-# GROK2API_REG_CONCURRENCY=3
-# TURNSTILE_THREAD=3
+# GROK2API_REG_CONCURRENCY=1
+# GROK2API_REG_PREFETCH_SLOTS=0
+# TURNSTILE_THREAD=1
+# TURNSTILE_NICE=10
 ```
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `GROK2API_CAPTCHA_PROVIDER` | `local` | `local`（容器内联）/ `yescaptcha` |
 | `GROK2API_INLINE_SOLVER` | `1` | `1` 时入口脚本在主容器内启动过盾 |
-| `GROK2API_REG_CONCURRENCY` | `3` | 协议注册默认并发 |
-| `TURNSTILE_THREAD` | `= REG_CONCURRENCY` | 本地过盾浏览器线程数 |
+| `GROK2API_REG_CONCURRENCY` | `1` | 协议注册默认并发；API 与注册共机时保持单槽 |
+| `GROK2API_REG_PREFETCH_SLOTS` | `0` | 当前任务结束前不预取下一项注册任务 |
+| `TURNSTILE_THREAD` | `1` | 本地过盾浏览器槽数，独立于 API worker 数 |
+| `TURNSTILE_NICE` | `10` | Solver/Camoufox 调度优先级（`0..19`，值越大优先级越低） |
 | `TURNSTILE_BROWSER_TYPE` | `camoufox` | 过盾浏览器类型 |
 | `TURNSTILE_PORT` | `5072` | 内联过盾监听端口（容器内 loopback） |
 | `TURNSTILE_POOL_ACQUIRE_TIMEOUT_SEC` | `30` | 等待可用浏览器的最长秒数 |
 | `TURNSTILE_POOL_REBUILD_TIMEOUT_SEC` | `60` | 浏览器池关闭或初始化的最长秒数 |
 | `TURNSTILE_BROWSER_CLOSE_TIMEOUT_SEC` | `10` | 单次 context / 失败清理的最长秒数 |
 
-> 2 核小机器建议 `TURNSTILE_THREAD=1~2`；`3` 已较重，`5` 容易把 CPU/内存打满。
+> API 与注册共机时建议保持 `1/1`。只有独立注册节点或资源反馈证明有余量时才提高；增加 Uvicorn worker 或浏览器槽不会降低 Grok 上游本身的首 token 等待。
 
 **默认只映射应用端口 `3000`（内联部署）。**  
 栈内 **PostgreSQL / Redis / 本地过盾** 都不绑定宿主机端口：

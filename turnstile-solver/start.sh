@@ -5,9 +5,17 @@ cd "$(dirname "$0")"
 
 HOST="${TURNSTILE_HOST:-0.0.0.0}"
 PORT="${TURNSTILE_PORT:-5072}"
-THREAD="${TURNSTILE_THREAD:-2}"
+THREAD="${TURNSTILE_THREAD:-1}"
+NICE="${TURNSTILE_NICE:-10}"
 BROWSER_TYPE="${TURNSTILE_BROWSER_TYPE:-camoufox}"
 LOG_FILE="${TURNSTILE_LOG:-logs/turnstile_solver.log}"
+
+if [[ ! "${NICE}" =~ ^[0-9]+$ ]] || (( 10#${NICE} > 19 )); then
+  echo "[turnstile-solver] WARN: TURNSTILE_NICE must be 0..19; using 10" >&2
+  NICE=10
+else
+  NICE="$((10#${NICE}))"
+fi
 
 mkdir -p logs keys
 
@@ -34,8 +42,8 @@ fi
 pkill -f "api_solver.py --browser_type .* --port ${PORT}" 2>/dev/null || true
 sleep 1
 
-echo "[turnstile-solver] starting ${BROWSER_TYPE} thread=${THREAD} ${HOST}:${PORT}"
-nohup .venv/bin/python api_solver.py \
+echo "[turnstile-solver] starting ${BROWSER_TYPE} thread=${THREAD} nice=${NICE} ${HOST}:${PORT}"
+nohup nice -n "${NICE}" .venv/bin/python api_solver.py \
   --browser_type "${BROWSER_TYPE}" \
   --thread "${THREAD}" \
   --debug \

@@ -65,8 +65,10 @@ export GROK2API_DATABASE_URL="${GROK2API_DATABASE_URL:-$DATABASE_URL}"
 # Inline captcha (only meaningful when running with entrypoint / docker image)
 export GROK2API_CAPTCHA_PROVIDER="${GROK2API_CAPTCHA_PROVIDER:-local}"
 export GROK2API_INLINE_SOLVER="${GROK2API_INLINE_SOLVER:-1}"
-export GROK2API_REG_CONCURRENCY="${GROK2API_REG_CONCURRENCY:-3}"
-export TURNSTILE_THREAD="${TURNSTILE_THREAD:-${GROK2API_REG_CONCURRENCY:-3}}"
+export GROK2API_REG_CONCURRENCY="${GROK2API_REG_CONCURRENCY:-1}"
+export GROK2API_REG_PREFETCH_SLOTS="${GROK2API_REG_PREFETCH_SLOTS:-0}"
+export TURNSTILE_THREAD="${TURNSTILE_THREAD:-1}"
+export TURNSTILE_NICE="${TURNSTILE_NICE:-10}"
 export TURNSTILE_BROWSER_TYPE="${TURNSTILE_BROWSER_TYPE:-camoufox}"
 export TURNSTILE_PORT="${TURNSTILE_PORT:-5072}"
 
@@ -80,7 +82,7 @@ echo "  Workers:   \${GROK2API_WORKERS:-auto(cpu)}"
 echo "  Redis:     ${REDIS_URL}"
 echo "  Postgres:  ${DATABASE_URL%%@*}@…"
 echo "  Mode:      hybrid multi-worker (file backend disabled)"
-echo "  Captcha:   provider=${GROK2API_CAPTCHA_PROVIDER} inline=${GROK2API_INLINE_SOLVER} threads=${TURNSTILE_THREAD}"
+echo "  Captcha:   provider=${GROK2API_CAPTCHA_PROVIDER} inline=${GROK2API_INLINE_SOLVER} threads=${TURNSTILE_THREAD} nice=${TURNSTILE_NICE}"
 echo ""
 
 exec $PY app.py

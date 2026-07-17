@@ -13,12 +13,18 @@ fi
 provider="$(echo "${GROK2API_CAPTCHA_PROVIDER:-${CAPTCHA_PROVIDER:-local}}" | tr '[:upper:]' '[:lower:]')"
 enable_solver="${GROK2API_INLINE_SOLVER:-1}"
 solver_port="${TURNSTILE_PORT:-5072}"
-# Keep captcha browser pool size aligned with registration concurrency.
-reg_concurrency="${GROK2API_REG_CONCURRENCY:-3}"
-solver_thread="${TURNSTILE_THREAD:-${reg_concurrency}}"
+solver_thread="${TURNSTILE_THREAD:-1}"
 solver_browser="${TURNSTILE_BROWSER_TYPE:-camoufox}"
 solver_host="${TURNSTILE_HOST:-127.0.0.1}"
+solver_nice="${TURNSTILE_NICE:-10}"
 solver_pid=""
+
+if [[ ! "${solver_nice}" =~ ^[0-9]+$ ]] || (( 10#${solver_nice} > 19 )); then
+  echo "[entrypoint] WARN: solver_nice must be an integer from 0 to 19; using 10" >&2
+  solver_nice=10
+else
+  solver_nice="$((10#${solver_nice}))"
+fi
 
 start_inline_solver() {
   if [[ ! -f /app/turnstile-solver/api_solver.py ]]; then
@@ -30,10 +36,10 @@ start_inline_solver() {
   # TURNSTILE_LAZY=0 restores eager warm-up. TURNSTILE_IDLE_SEC=0 disables reclaim.
   export TURNSTILE_LAZY="${TURNSTILE_LAZY:-1}"
   export TURNSTILE_IDLE_SEC="${TURNSTILE_IDLE_SEC:-180}"
-  echo "[entrypoint] starting inline turnstile-solver on ${solver_host}:${solver_port} (thread=${solver_thread}, browser=${solver_browser}, lazy=${TURNSTILE_LAZY}, idle=${TURNSTILE_IDLE_SEC}s)"
+  echo "[entrypoint] starting inline turnstile-solver on ${solver_host}:${solver_port} (thread=${solver_thread}, browser=${solver_browser}, nice=${solver_nice}, lazy=${TURNSTILE_LAZY}, idle=${TURNSTILE_IDLE_SEC}s)"
   (
     cd /app/turnstile-solver
-    exec python api_solver.py \
+    exec nice -n "${solver_nice}" python api_solver.py \
       --browser_type "${solver_browser}" \
       --thread "${solver_thread}" \
       --host "${solver_host}" \
