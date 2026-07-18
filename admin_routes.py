@@ -230,6 +230,10 @@ class EmailRegistrationBody(BaseModel):
         max_length=256,
         description="MoeMail only; YYDS/GPTMail use fixed hosts",
     )
+    # Keep provider-specific hosts available to the registration start route;
+    # otherwise a request switching from YYDS can silently reuse the old host.
+    moemail_base_url: str | None = Field(default=None, max_length=256)
+    cfmail_base_url: str | None = Field(default=None, max_length=256)
     proxy: str | None = Field(default=None, max_length=512)
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
@@ -278,6 +282,8 @@ class RegistrationConfigBody(BaseModel):
         max_length=256,
         description="MoeMail only; YYDS/GPTMail ignore this (fixed hosts)",
     )
+    moemail_base_url: str | None = Field(default=None, max_length=256)
+    cfmail_base_url: str | None = Field(default=None, max_length=256)
     api_key: str | None = Field(
         default=None,
         max_length=512,
