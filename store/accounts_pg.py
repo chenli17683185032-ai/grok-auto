@@ -41,20 +41,22 @@ def read_auth_map() -> dict[str, Any]:
         ):
             # Shallow copy is enough: callers treat entries as read-only snapshots.
             return dict(_auth_map_cache)
-    out: dict[str, Any] = {}
-    with connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, payload FROM accounts")
-            for row in cur.fetchall():
-                aid, payload = row[0], row[1]
-                if isinstance(payload, str):
-                    try:
-                        payload = json.loads(payload)
-                    except json.JSONDecodeError:
-                        continue
-                if isinstance(payload, dict):
-                    out[str(aid)] = payload
-    with _auth_map_cache_lock:
+        # Publish the database snapshot while still holding the same lock used
+        # by invalidation. Otherwise an older in-flight SELECT can repopulate
+        # the cache after a committed write has already invalidated it.
+        out: dict[str, Any] = {}
+        with connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, payload FROM accounts")
+                for row in cur.fetchall():
+                    aid, payload = row[0], row[1]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                    if isinstance(payload, dict):
+                        out[str(aid)] = payload
         _auth_map_cache = out
         _auth_map_cache_at = time.time()
         return dict(out)
