@@ -27,7 +27,10 @@ class AccountModeCacheTests(unittest.TestCase):
             self.assertEqual(settings_store.get_account_mode(), "round_robin")
 
     def test_set_mode_updates_cache_immediately(self) -> None:
-        with patch.object(settings_store, "_save"):
+        with (
+            patch.object(settings_store, "_pg_settings", return_value=None),
+            patch.object(settings_store, "_save"),
+        ):
             settings_store.set_account_mode("least_used")
         self.assertEqual(settings_store.get_account_mode(), "least_used")
 
