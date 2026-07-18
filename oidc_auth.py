@@ -1491,17 +1491,22 @@ def purge_refresh_invalid_accounts(
     """
     data = read_auth_map()
     doomed: list[tuple[str, str]] = []
+    # A marked account is already excluded by refresh_all_accounts() and
+    # mark_refresh_invalid() has already removed it from the durable pool. Do
+    # not repeat the same PG write and log on every maintainer sweep. Hard
+    # delete remains an explicit opt-in and still processes these rows.
+    already_invalid: list[tuple[str, str]] = []
+    do_hard = _hard_delete_invalid_refresh_enabled() if hard_delete is None else bool(hard_delete)
     now = time.time()
     for aid, entry in list(data.items()):
         if not isinstance(entry, dict):
             continue
         if entry.get("refresh_invalid"):
-            doomed.append(
-                (
-                    aid,
-                    str(entry.get("refresh_invalid_reason") or "refresh_invalid")[:300],
-                )
-            )
+            reason = str(entry.get("refresh_invalid_reason") or "refresh_invalid")[:300]
+            if do_hard:
+                doomed.append((aid, reason))
+            else:
+                already_invalid.append((aid, reason))
             continue
 
         has_rt = bool(entry.get("refresh_token"))
@@ -1521,13 +1526,13 @@ def purge_refresh_invalid_accounts(
             if float(exp) <= now:
                 doomed.append((aid, "no_refresh_token_and_access_expired"))
 
-    do_hard = _hard_delete_invalid_refresh_enabled() if hard_delete is None else bool(hard_delete)
     if dry_run:
         return {
             "ok": True,
             "dry_run": True,
             "would_delete": len(doomed) if do_hard else 0,
             "would_disable": 0 if do_hard else len(doomed),
+            "already_invalid": len(already_invalid),
             "hard_delete": do_hard,
             "ids": [a for a, _ in doomed[:100]],
             "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
@@ -1537,6 +1542,7 @@ def purge_refresh_invalid_accounts(
             "ok": True,
             "deleted": 0,
             "disabled": 0,
+            "skipped": len(already_invalid),
             "ids": [],
             "sample": [],
             "hard_delete": do_hard,
@@ -1591,6 +1597,7 @@ def purge_refresh_invalid_accounts(
             "ok": True,
             "deleted": len(removed),
             "disabled": 0,
+            "skipped": len(already_invalid),
             "ids": removed[:100],
             "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
             "by_reason": by_reason,
@@ -1616,6 +1623,7 @@ def purge_refresh_invalid_accounts(
         "ok": True,
         "deleted": 0,
         "disabled": disabled,
+        "skipped": len(already_invalid),
         "ids": ids[:100],
         "sample": [{"id": a, "reason": r[:160]} for a, r in doomed[:5]],
         "by_reason": by_reason,
