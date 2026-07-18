@@ -458,7 +458,24 @@ class XConsoleAuthClient:
         )
 
     def create_email_validation_code(self, email: str) -> GrpcResult:
-        return self._grpc_call(C.RPC_CREATE_CODE, [(1, email)], self.signup_url)
+        result = self._grpc_call(C.RPC_CREATE_CODE, [(1, email)], self.signup_url)
+        # x.ai now also returns HTTP 200 with no gRPC-web body after accepting
+        # this fire-and-forget operation. The following mailbox wait remains
+        # the authoritative check that a code was actually sent.
+        if (
+            result.http_status == 200
+            and result.grpc_status is None
+            and not result.raw
+        ):
+            return GrpcResult(
+                ok=True,
+                http_status=result.http_status,
+                grpc_status=None,
+                messages=result.messages,
+                trailers=result.trailers,
+                raw=result.raw,
+            )
+        return result
 
     def verify_email_validation_code(self, email: str, code: str) -> GrpcResult:
         return self._grpc_call(C.RPC_VERIFY_CODE, [(1, email), (2, code)], self.signup_url)
