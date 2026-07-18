@@ -27,6 +27,8 @@ _mem: dict[str, Any] | None = None
 _mem_dirty = False
 _flush_timer: threading.Timer | None = None
 _FLUSH_DELAY_SEC = 1.0
+_account_mode_cache: tuple[float, str] | None = None
+_ACCOUNT_MODE_CACHE_TTL_SEC = 5.0
 
 
 def _ensure() -> None:
@@ -530,14 +532,35 @@ def _normalize_mode(mode: str | None) -> str:
 
 
 def get_account_mode() -> str:
+    global _account_mode_cache
     # Env override wins when set
     if ACCOUNT_MODE:
         return _normalize_mode(ACCOUNT_MODE)
-    data = _load()
-    return _normalize_mode(str(data.get("account_mode") or DEFAULT_ACCOUNT_MODE))
+    now = time.time()
+    cached = _account_mode_cache
+    if cached is not None and now - cached[0] < _ACCOUNT_MODE_CACHE_TTL_SEC:
+        return cached[1]
+
+    # Account selection is on the request hot path. Read only this scalar from
+    # PostgreSQL instead of entering _load(), which refreshes every durable
+    # setting under the global settings lock.
+    raw: Any = None
+    pg = _pg_settings()
+    if pg is not None:
+        try:
+            raw = pg.get_setting("account_mode")
+        except Exception:
+            raw = None
+    if raw is None:
+        data = _load()
+        raw = data.get("account_mode") if isinstance(data, dict) else None
+    mode = _normalize_mode(str(raw or DEFAULT_ACCOUNT_MODE))
+    _account_mode_cache = (now, mode)
+    return mode
 
 
 def set_account_mode(mode: str) -> str:
+    global _account_mode_cache
     raw = (mode or "").strip().lower()
     raw = _LEGACY_MODES.get(raw, raw)
     if raw not in VALID_ACCOUNT_MODES:
@@ -552,6 +575,7 @@ def set_account_mode(mode: str) -> str:
         data.pop("preferred_account_id", None)
         data["updated_at"] = time.time()
         _save(data, immediate=True)
+    _account_mode_cache = (time.time(), mode)
     return mode
 
 
@@ -1096,6 +1120,7 @@ def _get_setting_value(key: str, default: Any = None) -> Any:
 
 
 def _set_setting_value(key: str, value: Any) -> Any:
+    global _account_mode_cache
     # Write PostgreSQL first so other workers can observe the change immediately
     # via _get_setting_value / periodic refresh (do not rely on sticky mem alone).
     pg = _pg_settings()
@@ -1116,6 +1141,8 @@ def _set_setting_value(key: str, value: Any) -> Any:
             pg.set_setting(key, value)
         except Exception:
             pass
+    if key == "account_mode":
+        _account_mode_cache = (time.time(), _normalize_mode(str(value)))
     return value
 
 
