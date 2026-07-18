@@ -43,6 +43,18 @@ class TokenMaintainerMetricsTests(unittest.TestCase):
         ):
             self.assertEqual(token_maintainer._next_wait_seconds(), 90.0)
 
+    def test_current_empty_sweep_is_used_for_wait_calculation(self) -> None:
+        with (
+            patch.dict("os.environ", {"GROK2API_TOKEN_MAINTAIN_INTERVAL": "90"}),
+            patch.object(token_maintainer, "_min_remaining_seconds", return_value=-1.0),
+        ):
+            self.assertEqual(
+                token_maintainer._next_wait_seconds(
+                    {"attempted": 0, "failed": 0, "skipped": 3739}
+                ),
+                90.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

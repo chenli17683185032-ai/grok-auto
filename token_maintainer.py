@@ -114,7 +114,7 @@ def _min_remaining_seconds(*, force: bool = False) -> float | None:
     return value
 
 
-def _next_wait_seconds() -> float:
+def _next_wait_seconds(refresh: dict[str, Any] | None = None) -> float:
     """
     Adaptive sleep: if any token expires soon, poll more frequently so
     expires_at gets refreshed automatically without manual clicks.
@@ -123,7 +123,9 @@ def _next_wait_seconds() -> float:
     # Once a complete sweep has no refresh candidates, do not spin every 30s
     # merely because an unrelated account has an already-expired access token.
     # Request-path refresh and the next normal interval still provide recovery.
-    last_refresh = _last_run.get("refresh") if isinstance(_last_run, dict) else None
+    last_refresh = refresh
+    if last_refresh is None:
+        last_refresh = _last_run.get("refresh") if isinstance(_last_run, dict) else None
     if isinstance(last_refresh, dict):
         try:
             if int(last_refresh.get("attempted") or 0) == 0 and int(
@@ -298,7 +300,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
         except Exception:
             pass
     try:
-        slim_last["next_wait_sec"] = _next_wait_seconds()
+        slim_last["next_wait_sec"] = _next_wait_seconds(slim_last.get("refresh"))
     except Exception:
         slim_last["next_wait_sec"] = _interval()
     # Durable task log for admin「任务日志」.
@@ -562,6 +564,7 @@ def status(*, light: bool = False) -> dict[str, Any]:
                         "workers",
                         "failed",
                         "skipped",
+                        "terminal_skipped",
                         "invalidated",
                         "deleted",
                         "sweep",
