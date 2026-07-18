@@ -43,14 +43,16 @@ class RegistrationIsolationComposeTests(unittest.TestCase):
         self.assertIn('GROK2API_REG_CONCURRENCY: "1"', worker)
         self.assertIn('GROK2API_REG_PREFETCH_SLOTS: "0"', worker)
         self.assertIn('GROK2API_REG_AUTO_REST_SEC: "600"', worker)
-        self.assertIn('GROK2API_REG_MAX_MEMORY_BYTES: "1449551462"', worker)
-        self.assertIn('GROK2API_REG_MAX_PIDS: "220"', worker)
+        self.assertIn('GROK2API_REG_ADAPTIVE_CONCURRENCY: "1"', worker)
+        self.assertIn('GROK2API_REG_MAX_CONCURRENCY: "2"', worker)
+        self.assertIn('GROK2API_REG_MAX_MEMORY_BYTES: "1900000000"', worker)
+        self.assertIn('GROK2API_REG_MAX_PIDS: "300"', worker)
         self.assertIn('TURNSTILE_THREAD: "1"', worker)
         self.assertIn('TURNSTILE_NICE: "10"', worker)
         self.assertIn('restart: "no"', worker)
-        self.assertIn('mem_limit: 1536m', worker)
-        self.assertIn('cpus: "0.50"', worker)
-        self.assertIn('pids_limit: 256', worker)
+        self.assertIn('mem_limit: 2g', worker)
+        self.assertIn('cpus: "0.75"', worker)
+        self.assertIn('pids_limit: 320', worker)
         self.assertNotIn("\n    ports:", worker)
         self.assertNotIn("\n      new-api:", worker)
 
@@ -104,7 +106,7 @@ class RegistrationWorkerTests(unittest.TestCase):
             patch.object(worker.redis_client, "ping", return_value=True),
             patch.object(worker.pg, "ping", return_value=True),
             patch.object(worker.registration_maintainer, "is_enabled", return_value=True),
-            patch.object(worker.registration_maintainer, "_batch_size", return_value=2),
+            patch.object(worker.registration_maintainer, "_batch_size", return_value=3),
             patch.object(worker.registration_maintainer, "_concurrency", return_value=1),
             patch.object(worker.registration_maintainer, "_rest_sec", return_value=600),
             patch.object(worker.adapter, "REG_PREFETCH_SLOTS", 0),
@@ -162,6 +164,23 @@ class RegistrationWorkerTests(unittest.TestCase):
             patch.object(worker, "_validate_runtime"),
             patch.object(worker, "_write_heartbeat"),
             patch.object(worker, "_cgroup_snapshot", return_value=(1, 1, 0)),
+            patch.object(
+                worker,
+                "read_snapshot",
+                return_value=worker.ResourceSnapshot(
+                    at=1.0,
+                    cpu_idle_pct=None,
+                    mem_available_bytes=4 * 1024 * 1024 * 1024,
+                    registration_memory_bytes=1,
+                    registration_pids=1,
+                    registration_oom_kill=0,
+                    api_healthy=True,
+                    api_age_sec=1.0,
+                    api_local_p95_ms=100.0,
+                    api_sample_count=1,
+                    api_error_rate=0.0,
+                ),
+            ),
             patch.object(worker.registration_maintainer, "start_background") as start,
             patch.object(worker.registration_maintainer, "stop_background") as stop_bg,
             patch.object(worker.adapter, "stop_all_active_registrations") as stop_all,

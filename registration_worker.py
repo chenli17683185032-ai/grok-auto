@@ -9,6 +9,13 @@ from pathlib import Path
 
 import grok_build_adapter as adapter
 import registration_maintainer
+from registration_controller import (
+    AdaptiveRegistrationController,
+    ResourceSnapshot,
+    current_state as controller_state,
+    read_snapshot,
+    set_current,
+)
 from store import pg, redis_client
 
 
@@ -71,10 +78,12 @@ def _validate_runtime() -> None:
         raise RuntimeError("registration worker requires healthy PostgreSQL")
     if not registration_maintainer.is_enabled():
         raise RuntimeError("registration maintainer must be enabled")
-    if registration_maintainer._batch_size() != 1:
-        raise RuntimeError("registration batch size must be exactly 1")
-    if registration_maintainer._concurrency() != 1:
-        raise RuntimeError("registration concurrency must be exactly 1")
+    batch_size = registration_maintainer._batch_size()
+    concurrency = registration_maintainer._concurrency()
+    if batch_size < 1 or batch_size > 2:
+        raise RuntimeError("registration batch size must stay between 1 and 2")
+    if concurrency < 1 or concurrency > 2:
+        raise RuntimeError("registration concurrency must stay between 1 and 2")
     if registration_maintainer._rest_sec() < 600:
         raise RuntimeError("registration rest interval must be at least 600 seconds")
     if int(adapter.REG_PREFETCH_SLOTS) != 0:
@@ -109,20 +118,35 @@ def run(
     _, _, baseline_oom_kill = _cgroup_snapshot()
     max_memory_bytes = _env_int(
         "GROK2API_REG_MAX_MEMORY_BYTES",
-        1_449_551_462,
+        1_900_000_000,
         256 * 1024 * 1024,
         8 * 1024 * 1024 * 1024,
     )
-    max_pids = _env_int("GROK2API_REG_MAX_PIDS", 220, 32, 4096)
-    guard_samples = _env_int("GROK2API_REG_GUARD_SAMPLES", 3, 1, 60)
-    violations = 0
+    max_pids = _env_int("GROK2API_REG_MAX_PIDS", 300, 32, 4096)
     exit_code = 0
+    controller = AdaptiveRegistrationController.from_env(
+        startup_oom_kill=baseline_oom_kill
+    )
+    baseline_status = registration_maintainer.status(light=True)
+    baseline_last_batch = baseline_status.get("last_batch") or {}
+    baseline_last_batch_id = (
+        str(baseline_last_batch.get("batch_id") or "")
+        if isinstance(baseline_last_batch, dict)
+        else ""
+    )
+    initial = controller.evaluate(
+        read_snapshot(cgroup_root=CGROUP_ROOT),
+        promotion_ready=False,
+    )
+    set_current(initial)
+    single_slot_succeeded = False
 
     registration_maintainer.start_background()
     _write_heartbeat()
     print(
         "[registration-worker] started "
-        f"batch=1 concurrency=1 rest={registration_maintainer._rest_sec()}s "
+        f"batch<=2 concurrency=1..{controller.max_concurrency} "
+        f"rest={registration_maintainer._rest_sec()}s "
         f"max_memory={max_memory_bytes} max_pids={max_pids}",
         flush=True,
     )
@@ -131,31 +155,47 @@ def run(
             status = registration_maintainer.status(light=True)
             if not status.get("local_running"):
                 raise RuntimeError("registration maintainer thread stopped")
-            memory_bytes, pids, oom_kill = _cgroup_snapshot()
-            reason = _resource_guard_reason(
-                memory_bytes=memory_bytes,
-                pids=pids,
-                oom_kill=oom_kill,
-                baseline_oom_kill=baseline_oom_kill,
-                max_memory_bytes=max_memory_bytes,
-                max_pids=max_pids,
+            last_batch = status.get("last_batch") or {}
+            if (
+                isinstance(last_batch, dict)
+                and str(last_batch.get("batch_id") or "")
+                and str(last_batch.get("batch_id") or "") != baseline_last_batch_id
+                and int(last_batch.get("batch_ok") or 0) > 0
+                and int(status.get("concurrency") or 1) == 1
+            ):
+                single_slot_succeeded = True
+            snapshot = read_snapshot(cgroup_root=CGROUP_ROOT)
+            decision = controller.evaluate(
+                snapshot,
+                promotion_ready=single_slot_succeeded,
             )
-            if reason:
-                violations += 1
+            set_current(decision)
+            registration_maintainer._publish(
+                controller={
+                    **controller_state(),
+                    "safe": decision.safe,
+                    "stable_samples": decision.stable_samples,
+                    "promoted": decision.promoted,
+                    "cpu_idle_pct": snapshot.cpu_idle_pct,
+                    "mem_available_bytes": snapshot.mem_available_bytes,
+                    "api_local_p95_ms": snapshot.api_local_p95_ms,
+                    "api_sample_count": snapshot.api_sample_count,
+                },
+                concurrency=decision.allowed_concurrency,
+            )
+            if decision.promoted:
                 print(
-                    f"[registration-worker] resource warning "
-                    f"sample={violations}/{guard_samples}: {reason}",
+                    "[registration-worker] promoted registration concurrency "
+                    f"to {decision.allowed_concurrency}",
                     flush=True,
                 )
-                if violations >= guard_samples:
-                    exit_code = 75
-                    print(
-                        f"[registration-worker] resource guard tripped: {reason}",
-                        flush=True,
-                    )
-                    break
-            else:
-                violations = 0
+            if decision.stop:
+                exit_code = 75
+                print(
+                    f"[registration-worker] adaptive guard tripped: {decision.reason}",
+                    flush=True,
+                )
+                break
             _write_heartbeat()
     finally:
         try:

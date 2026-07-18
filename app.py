@@ -198,6 +198,13 @@ def _on_startup() -> None:
         print(f"  store: status unavailable ({e})")
 
     try:
+        import api_guard
+
+        api_guard.start_background()
+    except Exception as e:  # noqa: BLE001
+        print(f"  (api guard start skipped: {e})")
+
+    try:
         from oidc_auth import normalize_auth_file_keys
         from auth_store import read_auth_map
 
@@ -352,6 +359,12 @@ def _on_startup() -> None:
 
 
 async def _on_shutdown() -> None:
+    try:
+        import api_guard
+
+        api_guard.stop_background()
+    except Exception:
+        pass
     await _close_http_client()
 
 
@@ -1700,7 +1713,7 @@ class RequestTiming:
         self.emit(ok=True, first=kind)
 
     def emit(self, *, ok: bool = True, first: str | None = None, error: str | None = None) -> None:
-        if self.logged or not _ttft_log_enabled():
+        if self.logged:
             return
         self.logged = True
         try:
@@ -1750,6 +1763,14 @@ class RequestTiming:
                 if self.t_first_token is None
                 else max(0, int(round((self.t_first_token - self.t0) * 1000.0)))
             )
+            try:
+                import api_guard
+
+                api_guard.record_timing(local_ms=local, ttft_ms=ttft, ok=ok)
+            except Exception:
+                pass
+            if not _ttft_log_enabled():
+                return
             parts = [
                 f"  [ttft] id={self.req_id}",
                 f"proto={self.protocol}",
@@ -2726,6 +2747,7 @@ async def health():
             # light=True avoids rescanning auth.json for min_remaining on every poll
             "token_maintainer": token_maintainer.status(light=True),
             "model_health": __import__("model_health").status(light=True),
+            "api_guard": __import__("api_guard").snapshot(),
             "registration_maintainer": __import__("registration_maintainer").status(
                 light=True
             ),

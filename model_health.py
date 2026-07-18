@@ -328,6 +328,7 @@ def _save_last_probe(account_id: str | None, result: dict[str, Any], *, overwrit
             "auto_disabled": bool(result.get("auto_disabled")),
             "stream_ok": result.get("stream_ok"),
             "latency_ms": result.get("latency_ms"),
+            "ttft_ms": result.get("ttft_ms"),
         }
         # Only update last_probe if it's an explicit probe, or if there is no
         # existing probe snapshot. API call failures must not overwrite the
@@ -381,6 +382,7 @@ def probe_model_for_creds(
         auto_disable = MODEL_HEALTH_AUTO_DISABLE
 
     t0 = time.time()
+    started_perf = time.perf_counter()
     base: dict[str, Any] = {
         "ok": False,
         "available": False,
@@ -545,6 +547,7 @@ def probe_model_for_creds(
                     return base
 
                 got_data = False
+                first_data_perf: float | None = None
                 for line in resp.iter_lines():
                     if not line:
                         continue
@@ -552,12 +555,29 @@ def probe_model_for_creds(
                         line = line.decode("utf-8", errors="replace")
                     if line.startswith("data:"):
                         got_data = True
+                        first_data_perf = time.perf_counter()
                         break
                 base["ok"] = True
                 base["available"] = True
                 base["status_code"] = status
                 base["stream_ok"] = got_data
                 base["latency_ms"] = int((time.time() - t0) * 1000)
+                if first_data_perf is not None:
+                    base["ttft_ms"] = int(
+                        max(0.0, (first_data_perf - started_perf) * 1000.0)
+                    )
+                    # Probe feedback warms the same EWMA used by live
+                    # requests, without touching live success/failure stats.
+                    try:
+                        import account_pool
+
+                        account_pool.report_latency(
+                            creds.auth_key,
+                            model=model,
+                            latency_ms=base["ttft_ms"],
+                        )
+                    except Exception:
+                        pass
                 # Do NOT report_success here — probe is not live traffic.
                 _apply_success_status()
                 _save_last_probe(creds.auth_key, base, overwrite=report_stats)

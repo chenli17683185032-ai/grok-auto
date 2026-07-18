@@ -41,10 +41,20 @@ def _target() -> int:
 
 
 def _batch_size() -> int:
-    return _env_int("GROK2API_REG_AUTO_BATCH_SIZE", 500, 1, 5000)
+    configured = _env_int("GROK2API_REG_AUTO_BATCH_SIZE", 500, 1, 5000)
+    if _env_bool("GROK2API_REG_ADAPTIVE_CONCURRENCY", False):
+        return max(configured, _concurrency())
+    return configured
 
 
 def _concurrency() -> int:
+    if _env_bool("GROK2API_REG_ADAPTIVE_CONCURRENCY", False):
+        try:
+            from registration_controller import current_concurrency
+
+            return max(1, min(2, int(current_concurrency())))
+        except Exception:
+            return 1
     return _env_int("GROK2API_REG_CONCURRENCY", 1, 1, 10)
 
 
@@ -125,7 +135,7 @@ def _pool_counts() -> dict[str, int]:
     return {
         "total": int(pool.get("total") or len(rows)),
         "live": int(pool.get("live") or 0),
-        "enabled": int(pool.get("enabled") or 0),
+        "accounts_enabled": int(pool.get("enabled") or 0),
         "available": _available_from_accounts(rows),
     }
 
@@ -193,10 +203,11 @@ def _start_batch(attempts: int) -> dict[str, Any]:
     import grok_build_adapter as adapter
     from settings_store import resolve_registration_inputs
 
+    concurrency = min(max(1, _concurrency()), max(1, int(attempts)))
     resolved = resolve_registration_inputs(
         {
             "count": attempts,
-            "concurrency": _concurrency(),
+            "concurrency": concurrency,
             "stagger_ms": 0,
             "probe_delay_sec": 0,
         }
@@ -213,7 +224,7 @@ def _start_batch(attempts: int) -> dict[str, Any]:
         local_solver_url=resolved.get("local_solver_url") or None,
         yescaptcha_key=resolved.get("yescaptcha_key") or None,
         count=attempts,
-        concurrency=_concurrency(),
+        concurrency=concurrency,
         stagger_ms=0,
         probe_delay_sec=0,
         force_batch=True,
@@ -306,6 +317,7 @@ def _worker() -> None:
                 continue
 
             attempts = min(_batch_size(), deficit)
+            concurrency = min(_concurrency(), attempts)
             result = _start_batch(attempts)
             if not result.get("ok"):
                 error = str(result.get("error") or "registration batch start failed")[:300]
@@ -334,7 +346,7 @@ def _worker() -> None:
             print(
                 "  [registration-maintainer] started batch "
                 f"{batch_id[-8:]} attempts={attempts} "
-                f"available={counts['available']}/{target} concurrency={_concurrency()}",
+                f"available={counts['available']}/{target} concurrency={concurrency}",
                 flush=True,
             )
             if _wait(2.0):
@@ -398,6 +410,7 @@ def status(*, light: bool = False) -> dict[str, Any]:
         pass
 
     out = {
+        **snapshot,
         "enabled": is_enabled(),
         "running": bool(cluster_running),
         "local_running": local_running,
@@ -408,8 +421,13 @@ def status(*, light: bool = False) -> dict[str, Any]:
         "concurrency": _concurrency(),
         "rest_sec": _rest_sec(),
         "monitor_sec": _monitor_sec(),
-        **snapshot,
     }
+    try:
+        from registration_controller import current_state
+
+        out["controller"] = current_state()
+    except Exception:
+        pass
     if light:
         if not out.get("last_error"):
             out.pop("last_error", None)
