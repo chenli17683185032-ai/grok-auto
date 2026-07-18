@@ -25,6 +25,46 @@ _min_remaining_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _MIN_REMAINING_CACHE_TTL = 15.0
 
 
+def _summarize_refresh(refresh: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep terminal skips out of permanent-failure metrics.
+
+    ``refresh_all_accounts`` returns marked ``refresh_invalid`` rows as
+    skipped results. They are useful accounting data, but they are not a new
+    invalidation and must not look like a delete/disable on every sweep.
+    """
+    source = refresh if isinstance(refresh, dict) else {}
+    summary = {k: v for k, v in source.items() if k != "results"}
+    rows = source.get("results")
+    if not isinstance(rows, list):
+        return summary
+
+    failed = [r for r in rows if not r.get("ok") and not r.get("skipped")]
+    terminal_skipped = sum(
+        1
+        for r in rows
+        if r.get("skipped")
+        and r.get("reason") in ("refresh_invalid", "refresh_invalid_deleted")
+    )
+    invalidated = sum(
+        1
+        for r in rows
+        if not r.get("skipped")
+        and (
+            r.get("permanent")
+            or r.get("deleted")
+            or r.get("reason") in ("refresh_invalid", "refresh_invalid_deleted")
+        )
+    )
+    deleted_rows = sum(1 for r in rows if r.get("deleted") and not r.get("skipped"))
+    summary["failed_sample"] = failed[:5]
+    summary["failed"] = len(failed)
+    summary["skipped"] = sum(1 for r in rows if r.get("skipped"))
+    summary["terminal_skipped"] = terminal_skipped
+    summary["invalidated"] = invalidated
+    summary["deleted"] = int(source.get("deleted") or deleted_rows or 0)
+    return summary
+
+
 def _interval() -> float:
     try:
         # Allow 30s+ so operators can run faster recovery batches (e.g. 90s).
@@ -80,6 +120,18 @@ def _next_wait_seconds() -> float:
     expires_at gets refreshed automatically without manual clicks.
     """
     base = _interval()
+    # Once a complete sweep has no refresh candidates, do not spin every 30s
+    # merely because an unrelated account has an already-expired access token.
+    # Request-path refresh and the next normal interval still provide recovery.
+    last_refresh = _last_run.get("refresh") if isinstance(_last_run, dict) else None
+    if isinstance(last_refresh, dict):
+        try:
+            if int(last_refresh.get("attempted") or 0) == 0 and int(
+                last_refresh.get("failed") or 0
+            ) == 0:
+                return base
+        except (TypeError, ValueError):
+            pass
     rem = _min_remaining_seconds()
     if rem is None:
         return base
@@ -136,6 +188,11 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 result["purged_dead"] = {
                     "deleted": int((purged or {}).get("deleted") or 0),
                     "disabled": int((purged or {}).get("disabled") or 0),
+                    "skipped": int(
+                        (purged or {}).get("skipped")
+                        or (purged or {}).get("already_invalid")
+                        or 0
+                    ),
                     "action": (purged or {}).get("action") or "disabled",
                     "by_reason": (purged or {}).get("by_reason") or {},
                 }
@@ -175,30 +232,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             # Keep full result for the direct admin/API caller, but never retain
             # hundreds of per-account rows in the background status cache —
             # that alone made /health ~100KB on a 400+ pool.
-            rows = refresh.get("results") if isinstance(refresh, dict) else None
-            slim_refresh = {
-                k: v
-                for k, v in (refresh or {}).items()
-                if k != "results"
-            }
-            if isinstance(rows, list):
-                failed = [r for r in rows if not r.get("ok") and not r.get("skipped")]
-                slim_refresh["failed_sample"] = failed[:5]
-                slim_refresh["failed"] = len(failed)
-                slim_refresh["skipped"] = sum(1 for r in rows if r.get("skipped"))
-                slim_refresh["invalidated"] = sum(
-                    1
-                    for r in rows
-                    if r.get("permanent")
-                    or r.get("deleted")
-                    or r.get("reason")
-                    in ("refresh_invalid", "refresh_invalid_deleted")
-                )
-                slim_refresh["deleted"] = int(
-                    (refresh or {}).get("deleted")
-                    or sum(1 for r in rows if r.get("deleted"))
-                    or 0
-                )
+            slim_refresh = _summarize_refresh(refresh)
             result["refresh"] = slim_refresh
             accounts = list_accounts()
             result["accounts"] = []  # never embed full account list in status cache
@@ -218,6 +252,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                     f"failed={slim_refresh.get('failed')} "
                     f"deferred={slim_refresh.get('deferred')} "
                     f"deleted={slim_refresh.get('deleted') or slim_refresh.get('invalidated') or 0} "
+                    f"terminal_skip={slim_refresh.get('terminal_skipped') or 0} "
                     f"force={force}"
                     + (
                         f" sweep=gen:{sw.get('generation')} "
