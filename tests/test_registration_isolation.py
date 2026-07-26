@@ -22,39 +22,65 @@ def _service_block(compose: str, name: str) -> str:
     return tail[: next_service.start()] if next_service else tail
 
 
-class RegistrationIsolationComposeTests(unittest.TestCase):
-    def test_api_service_cannot_start_registration_or_browser(self) -> None:
+class ApiOnlyDeploymentTests(unittest.TestCase):
+    def test_server_compose_contains_only_api_dependencies(self) -> None:
         compose = (ROOT / "docker-compose.server.yml").read_text(encoding="utf-8")
         api = _service_block(compose, "grokcli-2api")
 
+        service_text = compose.split("services:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+        services = set(
+            re.findall(
+                r"^  ([a-zA-Z0-9][a-zA-Z0-9_-]*):$",
+                service_text,
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(
+            services,
+            {"grok-egress", "redis", "postgres", "grokcli-2api"},
+        )
+        self.assertIn("dockerfile: Dockerfile.api", api)
+        self.assertIn('GROK2API_API_ONLY: "1"', api)
         self.assertIn('GROK2API_REG_AUTO_MAINTAIN: "0"', api)
         self.assertIn('GROK2API_INLINE_SOLVER: "0"', api)
         self.assertIn('mem_limit: 2g', api)
         self.assertIn('cpus: "2.00"', api)
         self.assertIn('pids_limit: 256', api)
+        self.assertNotIn("TURNSTILE_", api)
+        self.assertNotIn("CAPTCHA_PROVIDER", api)
+        self.assertNotIn("LOCAL_SOLVER_URL", api)
+        self.assertNotIn("turnstile-solver", api)
+        self.assertNotIn("seccomp:unconfined", api)
+        self.assertNotIn("shm_size", api)
 
-    def test_registration_service_is_small_private_and_slow(self) -> None:
-        compose = (ROOT / "docker-compose.server.yml").read_text(encoding="utf-8")
-        worker = _service_block(compose, "grok-registration")
+    def test_api_image_excludes_registration_runtime(self) -> None:
+        dockerfile = (ROOT / "Dockerfile.api").read_text(encoding="utf-8")
+        ignore = (ROOT / "Dockerfile.api.dockerignore").read_text(encoding="utf-8")
 
-        self.assertIn('command: ["python", "registration_worker.py"]', worker)
-        self.assertIn('GROK2API_REG_AUTO_MAINTAIN: "1"', worker)
-        self.assertIn('GROK2API_REG_AUTO_BATCH_SIZE: "1"', worker)
-        self.assertIn('GROK2API_REG_CONCURRENCY: "1"', worker)
-        self.assertIn('GROK2API_REG_PREFETCH_SLOTS: "0"', worker)
-        self.assertIn('GROK2API_REG_AUTO_REST_SEC: "600"', worker)
-        self.assertIn('GROK2API_REG_ADAPTIVE_CONCURRENCY: "1"', worker)
-        self.assertIn('GROK2API_REG_MAX_CONCURRENCY: "2"', worker)
-        self.assertIn('GROK2API_REG_MAX_MEMORY_BYTES: "1900000000"', worker)
-        self.assertIn('GROK2API_REG_MAX_PIDS: "300"', worker)
-        self.assertIn('TURNSTILE_THREAD: "1"', worker)
-        self.assertIn('TURNSTILE_NICE: "10"', worker)
-        self.assertIn('restart: "no"', worker)
-        self.assertIn('mem_limit: 2g', worker)
-        self.assertIn('cpus: "0.75"', worker)
-        self.assertIn('pids_limit: 320', worker)
-        self.assertNotIn("\n    ports:", worker)
-        self.assertNotIn("\n      new-api:", worker)
+        self.assertNotIn("camoufox", dockerfile)
+        self.assertNotIn("patchright", dockerfile)
+        for path in (
+            "grok-build-auth",
+            "turnstile-solver",
+            "grok_build_adapter.py",
+            "registration_maintainer.py",
+            "registration_worker.py",
+            "moemail.py",
+            "yydsmail.py",
+        ):
+            self.assertIn(path, ignore)
+
+    def test_api_only_mode_removes_registration_routes(self) -> None:
+        config = (ROOT / "config.py").read_text(encoding="utf-8")
+        app = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('API_ONLY = _env_truthy("GROK2API_API_ONLY", "0")', config)
+        self.assertIn("if _config.API_ONLY:", app)
+        self.assertIn("app.router.routes[:]", app)
+        self.assertIn("_api_only_registration_guard", app)
+        self.assertIn("_api_only_openapi", app)
+        self.assertIn('/admin/api/accounts/register-email', app)
+        self.assertIn('/admin/api/register-email', app)
 
 
 class RegistrationWorkerTests(unittest.TestCase):

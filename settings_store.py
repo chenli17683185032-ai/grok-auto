@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any
 
-from config import ACCOUNT_MODE, ADMIN_PASSWORD, DATA_DIR, SETTINGS_FILE
+from config import ACCOUNT_MODE, ADMIN_PASSWORD, API_ONLY, DATA_DIR, SETTINGS_FILE
 
 _lock = threading.RLock()
 
@@ -88,6 +88,8 @@ _PG_SCALAR_KEYS = (
     # Protocol registration (MoeMail / YesCaptcha / proxy) — admin UI config
     "registration_config",
 )
+if API_ONLY:
+    _PG_SCALAR_KEYS = tuple(k for k in _PG_SCALAR_KEYS if k != "registration_config")
 
 
 def _load_disk() -> dict[str, Any]:
@@ -1402,12 +1404,12 @@ def apply_runtime_settings_to_modules() -> None:
         set_default_model_setting(get_default_model_setting())
     except Exception:
         pass
-    # Hydrate registration secrets (YesCaptcha / MoeMail / proxy) from DB into
-    # process env so adapter modules that read env/config at call time work.
-    try:
-        apply_registration_config_to_runtime()
-    except Exception:
-        pass
+    if not API_ONLY:
+        # Hydrate registration secrets into the full deployment only.
+        try:
+            apply_registration_config_to_runtime()
+        except Exception:
+            pass
 
 
 # ── protocol registration config (MoeMail / YesCaptcha / proxy) ────────────
@@ -2496,16 +2498,18 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
             pool_patch[k] = patch[k]
     if pool_patch:
         set_pool_policy(pool_patch)
-    if "registration_config" in patch and patch["registration_config"] is not None:
+    if (
+        not API_ONLY
+        and "registration_config" in patch
+        and patch["registration_config"] is not None
+    ):
         set_registration_config(patch["registration_config"])
     return get_public_settings()
 
 
 def get_public_settings() -> dict[str, Any]:
     data = _load()
-    # Secrets stay full for admin session API (admin-auth only); UI masks display.
-    reg = get_registration_config(include_secrets=True)
-    return {
+    result = {
         "account_mode": get_account_mode(),
         "account_modes": list(VALID_ACCOUNT_MODES),
         "has_admin_password": has_admin_password(),
@@ -2528,6 +2532,9 @@ def get_public_settings() -> dict[str, Any]:
         "conversation_affinity_enabled": get_conversation_affinity_enabled(),
         "default_model": get_default_model_setting(),
         "pool_policy": get_pool_policy(),
-        "registration_config": reg,
         "updated_at": data.get("updated_at"),
     }
+    if not API_ONLY:
+        # Secrets stay full for admin session API (admin-auth only); UI masks display.
+        result["registration_config"] = get_registration_config(include_secrets=True)
+    return result

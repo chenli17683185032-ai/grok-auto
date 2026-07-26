@@ -305,6 +305,7 @@ async function softNavigate(name, opts) {
     if (nt && $("page-title")) $("page-title").textContent = nt.textContent;
     if (ns && $("page-sub")) $("page-sub").textContent = ns.textContent;
     applyPageMeta(page);
+    applyDeploymentMode();
     if (!opts.replace) history.pushState({ g2aPage: page }, "", href);
     else history.replaceState({ g2aPage: page }, "", href);
 
@@ -813,6 +814,15 @@ function switchTab(name) {
   softNavigate(name);
 }
 
+function applyDeploymentMode() {
+  const apiOnly = !!(statusCache && statusCache.api_only);
+  document.documentElement.classList.toggle("g2a-api-only", apiOnly);
+  if (apiOnly) {
+    const registrationSection = $("registration-section");
+    if (registrationSection) registrationSection.remove();
+  }
+}
+
 function buildMobileNav() {
   const host = $("mobile-nav");
   if (!host) return;
@@ -836,6 +846,7 @@ async function bootstrap() {
     buildMobileNav();
     const page = document.body.dataset.page || pageFromPath(location.pathname) || "overview";
     applyPageMeta(page);
+    applyDeploymentMode();
 
     // Soft session restore: validate local token OR cookie session.
     // Never keep a stale local token that makes the UI look "logged in" while APIs 401.
@@ -852,6 +863,7 @@ async function bootstrap() {
 
     try {
       statusCache = await api("/status");
+      applyDeploymentMode();
       if (statusCache && statusCache.setup_needed) {
         token = "";
         try { if (window.G2A && G2A.clearToken) G2A.clearToken(); else localStorage.removeItem(TOKEN_KEY); } catch (_) {}
@@ -956,6 +968,7 @@ async function loadDashboard() {
     const now = Date.now();
     if (!statusCache || (now - _statusFetchedAt) > 5000) {
       statusCache = await api("/status");
+      applyDeploymentMode();
       _statusFetchedAt = now;
       if (window.G2A && G2A.state) G2A.state.status = statusCache;
       // Keep dash fields aligned so overview text switches immediately.

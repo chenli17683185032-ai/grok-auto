@@ -41,6 +41,10 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     )
 
 
+# Production API-only mode removes registration routes and background workers.
+API_ONLY = _env_truthy("GROK2API_API_ONLY", "0")
+
+
 # Dev hot-reload (uvicorn --reload). Production must keep this off.
 # When enabled, workers are forced to 1 (uvicorn cannot combine reload + multi-worker).
 RELOAD = _env_truthy("GROK2API_RELOAD", "0")

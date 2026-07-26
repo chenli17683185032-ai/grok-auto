@@ -35,29 +35,17 @@ class ApiPriorityDefaultsTests(unittest.TestCase):
             self.assertEqual(adapter.REG_PREFETCH_SLOTS, 0)
             self.assertEqual(maintainer._concurrency(), 1)
 
-    def test_server_compose_wires_api_priority_controls(self) -> None:
+    def test_server_compose_disables_registration_resources(self) -> None:
         compose = (ROOT / "docker-compose.server.yml").read_text(encoding="utf-8")
-        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "Dockerfile.api").read_text(encoding="utf-8")
 
-        self.assertIn('TURNSTILE_THREAD: "${TURNSTILE_THREAD:-1}"', compose)
-        self.assertIn(
-            'GROK2API_REG_CONCURRENCY: "${GROK2API_REG_CONCURRENCY:-1}"',
-            compose,
-        )
-        self.assertIn(
-            'GROK2API_REG_PREFETCH_SLOTS: "${GROK2API_REG_PREFETCH_SLOTS:-0}"',
-            compose,
-        )
-        self.assertIn('TURNSTILE_NICE: "${TURNSTILE_NICE:-10}"', compose)
-        dependency_layer = dockerfile.index("python -m camoufox fetch")
-        self.assertGreater(
-            dockerfile.index("GROK2API_REG_CONCURRENCY=1", dependency_layer),
-            dependency_layer,
-        )
-        self.assertGreater(
-            dockerfile.index("TURNSTILE_THREAD=1", dependency_layer),
-            dependency_layer,
-        )
+        self.assertIn('GROK2API_API_ONLY: "1"', compose)
+        self.assertIn('GROK2API_INLINE_SOLVER: "0"', compose)
+        self.assertIn('GROK2API_REG_AUTO_MAINTAIN: "0"', compose)
+        self.assertNotIn("TURNSTILE_", compose)
+        self.assertNotIn("GROK2API_REG_CONCURRENCY", compose)
+        self.assertNotIn("camoufox", dockerfile)
+        self.assertNotIn("patchright", dockerfile)
 
     def test_entrypoint_runs_solver_below_api_priority(self) -> None:
         entrypoint = (ROOT / "entrypoint.sh").read_text(encoding="utf-8")

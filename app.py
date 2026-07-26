@@ -57,7 +57,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.47-cache1"
+APP_VERSION = "1.9.47-api-only.1"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -318,19 +318,20 @@ def _on_startup() -> None:
                 )
         except Exception as e:  # noqa: BLE001
             print(f"  (model health failed: {e})")
-        try:
-            import registration_maintainer
+        if not _config.API_ONLY:
+            try:
+                import registration_maintainer
 
-            registration_maintainer.start_background()
-            rm = registration_maintainer.status(light=True)
-            if rm.get("enabled"):
-                print(
-                    "  registration maintainer: enabled "
-                    f"(target={rm.get('target')} batch={rm.get('batch_size')} "
-                    f"rest={rm.get('rest_sec')}s)"
-                )
-        except Exception as e:  # noqa: BLE001
-            print(f"  (registration maintainer failed: {e})")
+                registration_maintainer.start_background()
+                rm = registration_maintainer.status(light=True)
+                if rm.get("enabled"):
+                    print(
+                        "  registration maintainer: enabled "
+                        f"(target={rm.get('target')} batch={rm.get('batch_size')} "
+                        f"rest={rm.get('rest_sec')}s)"
+                    )
+            except Exception as e:  # noqa: BLE001
+                print(f"  (registration maintainer failed: {e})")
     else:
         # Multi-worker: this process lost the first election. store.leader keeps
         # watching and will start maintainers when the lock becomes free.
@@ -339,23 +340,26 @@ def _on_startup() -> None:
 
     # Registration engine is optional — never block API startup.
     # Engine: dongguatanglinux/grok-build-auth (HTTP protocol) + MoeMail + sso_to_auth_json.
-    try:
-        import grok_build_adapter as _reg
+    if _config.API_ONLY:
+        print("  registration: disabled (API-only mode)")
+    else:
+        try:
+            import grok_build_adapter as _reg
 
-        st = _reg.registration_available()
-        if st.get("available"):
-            print(
-                "  registration: ready "
-                f"(engine={st.get('engine') or 'grok-build-auth'} "
-                f"build={st.get('adapter_build')})"
-            )
-        else:
-            print(
-                f"  registration: unavailable ({st.get('error')}) "
-                f"(build={st.get('adapter_build')})"
-            )
-    except Exception as e:  # noqa: BLE001
-        print(f"  registration: unavailable ({e})")
+            st = _reg.registration_available()
+            if st.get("available"):
+                print(
+                    "  registration: ready "
+                    f"(engine={st.get('engine') or 'grok-build-auth'} "
+                    f"build={st.get('adapter_build')})"
+                )
+            else:
+                print(
+                    f"  registration: unavailable ({st.get('error')}) "
+                    f"(build={st.get('adapter_build')})"
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  registration: unavailable ({e})")
 
 
 async def _on_shutdown() -> None:
@@ -420,6 +424,44 @@ async def _usage_request_context_middleware(request: Request, call_next):
 
 
 app.include_router(admin_router)
+
+
+def _is_registration_admin_path(path: str) -> bool:
+    return path.startswith("/admin/api/accounts/register-email") or path.startswith(
+        "/admin/api/register-email"
+    )
+
+
+if _config.API_ONLY:
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not _is_registration_admin_path(str(getattr(route, "path", "")))
+    ]
+
+
+@app.middleware("http")
+async def _api_only_registration_guard(request: Request, call_next):
+    if _config.API_ONLY and _is_registration_admin_path(str(request.url.path or "")):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
+
+
+if _config.API_ONLY:
+    _unfiltered_openapi = app.openapi
+
+    def _api_only_openapi():
+        schema = _unfiltered_openapi()
+        paths = schema.get("paths")
+        if isinstance(paths, dict):
+            schema["paths"] = {
+                path: item
+                for path, item in paths.items()
+                if not _is_registration_admin_path(str(path))
+            }
+        return schema
+
+    app.openapi = _api_only_openapi  # type: ignore[method-assign]
 
 
 # ── request models ──────────────────────────────────────────────────────────
@@ -2701,13 +2743,29 @@ def _normalize_stream_finish_reason(
 @app.get("/health")
 async def health():
     """Bounded readiness probe — never triggers OIDC refresh or full account dump."""
-    reg: dict[str, Any] = {"available": False}
-    try:
-        import grok_build_adapter as _reg
+    reg: dict[str, Any] = {
+        "available": False,
+        "enabled": not _config.API_ONLY,
+    }
+    if _config.API_ONLY:
+        reg["reason"] = "api_only"
+    else:
+        try:
+            import grok_build_adapter as _reg
 
-        reg = _reg.registration_available()
-    except Exception as e:  # noqa: BLE001
-        reg = {"available": False, "error": str(e)}
+            reg = _reg.registration_available()
+        except Exception as e:  # noqa: BLE001
+            reg = {"available": False, "enabled": True, "error": str(e)}
+    if _config.API_ONLY:
+        registration_maintainer_status = {
+            "enabled": False,
+            "running": False,
+            "reason": "api_only",
+        }
+    else:
+        registration_maintainer_status = __import__(
+            "registration_maintainer"
+        ).status(light=True)
     store_info: dict[str, Any] = {}
     leader_info: dict[str, Any] = {}
     try:
@@ -2733,6 +2791,7 @@ async def health():
         creds = await asyncio.to_thread(account_pool.acquire, auto_refresh=False)
         return {
             "status": "ok",
+            "api_only": _config.API_ONLY,
             "version": APP_VERSION,
             "email": creds.email,
             "expires_at": creds.expires_at,
@@ -2748,9 +2807,7 @@ async def health():
             "token_maintainer": token_maintainer.status(light=True),
             "model_health": __import__("model_health").status(light=True),
             "api_guard": __import__("api_guard").snapshot(),
-            "registration_maintainer": __import__("registration_maintainer").status(
-                light=True
-            ),
+            "registration_maintainer": registration_maintainer_status,
             "conversation_affinity": conversation_affinity.status(),
             "registration": reg,
             "store": store_info,
@@ -2761,6 +2818,7 @@ async def health():
             status_code=503,
             content={
                 "status": "auth_error",
+                "api_only": _config.API_ONLY,
                 "message": str(e),
                 "version": APP_VERSION,
                 "registration": reg,

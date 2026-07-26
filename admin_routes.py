@@ -24,14 +24,18 @@ from auth import AuthError, load_credentials, load_credentials_by_id
 import config as _config
 import sso_to_auth_json as sso_import
 
-# Registration adapter: dongguatanglinux/grok-build-auth protocol client.
-try:
-    import grok_build_adapter as reg_adapter
-except Exception as _reg_import_err:  # noqa: BLE001
+# Registration is not imported into API-only deployments.
+if _config.API_ONLY:
     reg_adapter = None  # type: ignore[assignment]
-    _REG_IMPORT_ERROR = str(_reg_import_err)
+    _REG_IMPORT_ERROR = "registration disabled in API-only mode"
 else:
-    _REG_IMPORT_ERROR = None
+    try:
+        import grok_build_adapter as reg_adapter
+    except Exception as _reg_import_err:  # noqa: BLE001
+        reg_adapter = None  # type: ignore[assignment]
+        _REG_IMPORT_ERROR = str(_reg_import_err)
+    else:
+        _REG_IMPORT_ERROR = None
 from config import (
     CLI_VERSION,
     DEFAULT_MODEL,
@@ -551,7 +555,13 @@ async def admin_status(request: Request):
 
     now = time.time()
     reg_status: dict[str, Any]
-    if _status_reg_cache is not None and now - _status_reg_at < 30:
+    if _config.API_ONLY:
+        reg_status = {
+            "available": False,
+            "enabled": False,
+            "reason": "api_only",
+        }
+    elif _status_reg_cache is not None and now - _status_reg_at < 30:
         reg_status = dict(_status_reg_cache)
     else:
         reg_status = {"available": False}
@@ -584,6 +594,7 @@ async def admin_status(request: Request):
 
     return {
         "ok": True,
+        "api_only": _config.API_ONLY,
         "setup_needed": setup,
         "version": _app_ver,
         "store": store_info,
@@ -1664,6 +1675,8 @@ async def get_sso_import_job(
 
 
 def _require_register_adapter():
+    if _config.API_ONLY:
+        raise HTTPException(status_code=404, detail="Not Found")
     if reg_adapter is None:
         raise HTTPException(
             status_code=503,

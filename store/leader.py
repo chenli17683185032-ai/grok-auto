@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Any
 
-from config import MAINTAINER_LEADER, MAINTAINER_LEADER_RENEW, MAINTAINER_LEADER_TTL, WORKERS
+from config import API_ONLY, MAINTAINER_LEADER, MAINTAINER_LEADER_RENEW, MAINTAINER_LEADER_TTL, WORKERS
 
 _lock = threading.Lock()
 _is_leader = False
@@ -89,14 +89,15 @@ def _start_maintainers_if_needed() -> None:
         print("  [leader] model health started", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"  [leader] model health start failed: {e}", flush=True)
-    try:
-        import registration_maintainer
+    if not API_ONLY:
+        try:
+            import registration_maintainer
 
-        registration_maintainer.start_background()
-        if registration_maintainer.is_enabled():
-            print("  [leader] registration maintainer started", flush=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"  [leader] registration maintainer start failed: {e}", flush=True)
+            registration_maintainer.start_background()
+            if registration_maintainer.is_enabled():
+                print("  [leader] registration maintainer started", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [leader] registration maintainer start failed: {e}", flush=True)
 
 
 def _stop_maintainers_if_needed() -> None:
@@ -118,12 +119,13 @@ def _stop_maintainers_if_needed() -> None:
         model_health.stop_background()
     except Exception:
         pass
-    try:
-        import registration_maintainer
+    if not API_ONLY:
+        try:
+            import registration_maintainer
 
-        registration_maintainer.stop_background()
-    except Exception:
-        pass
+            registration_maintainer.stop_background()
+        except Exception:
+            pass
     print("  [leader] maintainers stopped (lost leadership)", flush=True)
 
 
