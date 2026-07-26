@@ -60,6 +60,9 @@ class ApiOnlyDeploymentTests(unittest.TestCase):
         self.assertNotIn("camoufox", dockerfile)
         self.assertNotIn("patchright", dockerfile)
         for path in (
+            "entrypoint.sh",
+            "scripts",
+            "tests",
             "grok-build-auth",
             "turnstile-solver",
             "grok_build_adapter.py",

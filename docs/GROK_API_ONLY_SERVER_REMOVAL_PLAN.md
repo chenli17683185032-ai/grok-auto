@@ -85,29 +85,29 @@
 
 ### 节点 D：服务器上线
 
-- [ ] 保存生产编排、环境变量键名清单、镜像 ID、容器状态和数据备份信息。
-- [ ] 先停止并删除注册专用容器，保持 API 继续服务。
-- [ ] 上传/拉取 API-only 配置与代码。
-- [ ] 仅在必要时滚动重建 API 容器，并计时中断窗口。
-- [ ] 使用 `--remove-orphans` 确认注册容器不会恢复。
+- [x] 保存生产编排、环境变量键名清单、镜像 ID、容器状态和数据备份信息。
+- [x] 删除注册专用历史容器，保持 API 必需的四服务拓扑。
+- [x] 上传 API-only 配置与代码，并在旧 API 继续服务时预构建新镜像。
+- [x] 仅重建 API 容器，并计时中断窗口。
+- [x] 使用 `--remove-orphans` 确认注册容器不会恢复。
 
 验证：服务器只运行确认保留的服务，API 容器 healthy，无注册容器、无重启循环。
 
 ### 节点 E：生产反馈验证
 
-- [ ] 请求 `/health` 或根就绪端点。
-- [ ] 使用现有受保护 API Key 请求 `/v1/models`。
-- [ ] 完成一条 OpenAI 兼容请求。
-- [ ] 完成一条 Anthropic 兼容请求（若生产正在提供该协议）。
-- [ ] 检查最近日志中 5xx、连接拒绝、代理解析失败和注册任务残留。
-- [ ] 观察一个稳定窗口并复查容器状态。
+- [x] 请求 `/health` 或根就绪端点。
+- [x] 使用现有受保护 API Key 请求 `/v1/models`。
+- [x] 完成一条 OpenAI 兼容请求。
+- [x] 完成一条 Anthropic 兼容请求。
+- [x] 检查最近日志中 5xx、连接拒绝、代理解析失败和注册任务残留。
+- [x] 观察一个稳定窗口并复查容器状态。
 
 验证：真实业务闭环成功，错误率与资源状态稳定。
 
 ### 节点 F：版本收口
 
-- [ ] 更新本计划的实测结果、变更清单和回滚点。
-- [ ] 提交本地变更。
+- [x] 更新本计划的实测结果、变更清单和回滚点。
+- [x] 提交本地变更。
 - [ ] 合并并推送 GitHub `main`。
 - [ ] 清理本任务产生的临时文件、构建缓存或临时分支/工作树；保留必要源码、计划和运维记录。
 
@@ -146,3 +146,13 @@
 - 四服务本地闭环：根就绪 200；空账号健康为预期 503 且 `api_only=true`；注册端点 404；OpenAPI 无注册路径；容器仅运行 API 主进程。
 - 节点 C 完成：通过重定向 Python 缓存目录避开 macOS 文件提供器阻塞；Git 跟踪测试集共 81 项通过，其中 72 项使用 `unittest`，9 项纯函数回归由等价轻量 runner 执行。
 - 全树状态扫描仍受工作区 Git 元数据读取时延影响，改用索引哈希和逐文件 diff 完成变更审阅；本任务变更与任务开始前的未跟踪 FA7 文件保持隔离。
+
+### 2026-07-26 生产上线与反馈
+
+- 代码提交 `7839866` 固定 API-only 功能，提交 `30141fb` 进一步排除镜像中的 `entrypoint.sh`、`scripts/` 和 `tests/`。生产 AMD64 镜像为 `grokcli-2api:20260726-api-only-30141fb`，ID `sha256:7f442128dfa3547000c9052c87e2d320a5dfeed6d960910d71cdcda85d7e3fa4`，入口仅 `python app.py`。
+- 发布目录 `/home/deploy/grok-releases/grok-api-only-30141fb`；回滚备份 `/home/deploy/grok-backups/grok-api-only-20260726-30141fb`。备份包含原 Compose/环境/容器与镜像信息、`registration_config`、完整 PostgreSQL custom dump、旧源码和上一版镜像压缩包，权限为目录 0700、文件 0600，并生成 SHA-256 清单。
+- 正式切换前用临时端口完成生产依赖预演：健康 200、`api_only=true`、注册入口 404、OpenAPI 无注册路径、现有生产 Key 请求 `/v1/models` 返回 3 个模型；临时容器随后自动删除。
+- 正式切换仅重建 `grokcli-2api`。250ms 采样的最长不可用窗口为 `22586ms`；egress、PostgreSQL、Redis 未重启。切换后 `registration_config=0`，而 `accounts=3739`、`account_pool=3739`、`api_keys=1` 与切换前一致。
+- 真实生产闭环：OpenAI `/v1/chat/completions` HTTP 200，Anthropic `/v1/messages` HTTP 200；两个注册入口均 404；OpenAPI 86 条路径中无注册路径。稳定窗口 12/12 次健康，API `restart=0`、5xx=0、错误/Traceback=0。
+- 活动基目录已同步 API-only 源码和无注册密钥 `.env`。旧注册项目的 7 个停止容器、全部旧 Grok 镜像标签和 3 个 RuyiPage 镜像标签已清理；当前只保留 API-only Grok 镜像。旧项目目录和注册源码移入受限回滚备份，磁盘占用约从 102GB 降到 90GB。
+- 云贝唯一运维手册 `/Users/ethan/Desktop/云贝/服务器相关/yunbay-new-api-vps-连接信息.md` 已更新生产目录、当前拓扑、验证结果、标准重建和仅回滚 API 的命令。

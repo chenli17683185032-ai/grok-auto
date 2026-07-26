@@ -21,10 +21,17 @@ RUN python -m pip install --no-cache-dir -U pip setuptools wheel \
     && python -m pip install --no-cache-dir -r /app/requirements-api.txt
 
 COPY . /app
-RUN test ! -e /app/grok-build-auth \
+RUN test ! -e /app/entrypoint.sh \
+    && test ! -e /app/scripts \
+    && test ! -e /app/tests \
+    && test ! -e /app/grok-build-auth \
     && test ! -e /app/turnstile-solver \
     && test ! -e /app/grok_build_adapter.py \
+    && test ! -e /app/registration_controller.py \
+    && test ! -e /app/registration_maintainer.py \
     && test ! -e /app/registration_worker.py \
+    && test ! -e /app/moemail.py \
+    && test ! -e /app/yydsmail.py \
     && python -c "import app, config; assert config.API_ONLY; print('build-check', app.APP_VERSION)"
 
 EXPOSE 3000
