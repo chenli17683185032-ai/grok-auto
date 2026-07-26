@@ -22,10 +22,12 @@ vendors
 **/cliproxyapi_auth
 static/js
 static/css
-scripts/build_admin_assets.py
+scripts
+tests
 docs
 dev.sh
 docker-rebuild.sh
+entrypoint.sh
 start.bat
 start.ps1
 start.sh
@@ -37,8 +39,3 @@ registration_maintainer.py
 registration_worker.py
 moemail.py
 yydsmail.py
-tests/test_fa7_registration_reuse.py
-tests/test_registration_config_fields.py
-tests/test_registration_controller.py
-tests/test_registration_isolation.py
-tests/test_turnstile_pool_recovery.py
