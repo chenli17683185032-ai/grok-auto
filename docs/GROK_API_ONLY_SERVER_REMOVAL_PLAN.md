@@ -108,10 +108,10 @@
 
 - [x] 更新本计划的实测结果、变更清单和回滚点。
 - [x] 提交本地变更。
-- [ ] 合并并推送 GitHub `main`。
-- [ ] 清理本任务产生的临时文件、构建缓存或临时分支/工作树；保留必要源码、计划和运维记录。
+- [x] 合并并推送 GitHub `main`。
+- [x] 清理本任务产生的临时文件、测试镜像和 Python 缓存；保留必要源码、计划和运维记录。
 
-验证：本地工作树干净，GitHub `main` 指向已部署且已验证的版本。
+验证：本任务跟踪文件与提交一致，GitHub `main` 指向已部署且已验证的版本；任务开始前已有的 `.env.example` 修改和未跟踪 FA7 文件原样保留，不纳入本次提交。
 
 ## 6. 回滚策略
 
@@ -156,3 +156,5 @@
 - 真实生产闭环：OpenAI `/v1/chat/completions` HTTP 200，Anthropic `/v1/messages` HTTP 200；两个注册入口均 404；OpenAPI 86 条路径中无注册路径。稳定窗口 12/12 次健康，API `restart=0`、5xx=0、错误/Traceback=0。
 - 活动基目录已同步 API-only 源码和无注册密钥 `.env`。旧注册项目的 7 个停止容器、全部旧 Grok 镜像标签和 3 个 RuyiPage 镜像标签已清理；当前只保留 API-only Grok 镜像。旧项目目录和注册源码移入受限回滚备份，磁盘占用约从 102GB 降到 90GB。
 - 云贝唯一运维手册 `/Users/ethan/Desktop/云贝/服务器相关/yunbay-new-api-vps-连接信息.md` 已更新生产目录、当前拓扑、验证结果、标准重建和仅回滚 API 的命令。
+- 功能、镜像收敛和上线记录已普通 fast-forward 推送到 `grok-auto/main@6b1a55b`，未使用 force。
+- 本地 `grokcli-2api:api-only-test*` 测试镜像和 `/tmp/grok-api-only-pycache-20260726`、工作树 `__pycache__` 已清理；无残留测试、Git pack 或预演容器进程。Clash `Proxy` 已从临时 `US 33 AI加速 x1.0` 恢复为 `JP 22 GMO x1.0`。
